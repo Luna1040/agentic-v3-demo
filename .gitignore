@@ -1,0 +1,23 @@
+node_modules/
+dist/
+data/
+.env
+*.log
+.verification/
+.local/
+.harness-contract/
+.env.*
+!.env.example
+# Local operation data and credentials must never enter a public source repository.
+HANDOFF.md
+*.dump
+*.backup
+*.sql.gz
+*.tar.gz
+*.zip
+*.pem
+*.key
+*.p12
+*.pfx
+.DS_Store
+Thumbs.db

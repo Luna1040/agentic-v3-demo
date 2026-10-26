@@ -1,0 +1,47 @@
+{
+  "name": "agentic-v3-demo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "dev": "tsx server/index.ts",
+    "start": "tsx server/index.ts --production",
+    "build": "vite build",
+    "check": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts",
+    "harness:build": "node scripts/build-harness.mjs",
+    "db:setup": "powershell -NoProfile -File scripts/postgres/setup.ps1",
+    "db:start": "powershell -NoProfile -File scripts/postgres/start.ps1",
+    "db:stop": "powershell -NoProfile -File scripts/postgres/stop.ps1",
+    "db:status": "powershell -NoProfile -File scripts/postgres/status.ps1",
+    "db:migrate": "tsx scripts/migrate.ts",
+    "db:seed-prompts": "tsx scripts/seed-prompts.ts",
+    "db:publish-world-prompts": "tsx scripts/publish-world-prompts.ts",
+    "db:import-agents": "tsx scripts/import-legacy-agents.ts",
+    "db:backup": "tsx scripts/backup-local.ts",
+    "db:import-characters": "tsx scripts/import-legacy-characters.ts",
+    "db:import-sqlite": "tsx scripts/import-sqlite.ts",
+    "verify": "npm run harness:build && npm run check && npm test && npm run build"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "lucide-react": "^0.468.0",
+    "pg": "^8.23.1",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^22.18.0",
+    "@types/pg": "^8.23.1",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "vite": "^7.1.3"
+  }
+}
