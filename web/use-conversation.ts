@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { ConversationController } from './conversation-controller';
 import { ApiError, type ApiClient } from './api';
 import type { SessionDetail, TurnEvent } from '../shared/contracts';
-import { initialConversation, markAttemptStatus, mergeMessages, needsOpening, openingAttempt, persistedOpening, recoverTurn, type Attempt } from './conversation-state';
+import { attemptForSend, initialConversation, markAttemptStatus, mergeMessages, needsOpening, openingAttempt, persistedOpening, recoverTurn, type Attempt } from './conversation-state';
 import { readPersistedTurn } from './turn-recovery';
 import { worldBackgroundStatus } from './world-model';
 
@@ -141,7 +141,7 @@ export function useConversation(client: ApiClient, sessionId: string | null, onC
     const opening = retry?.operation === 'opening';
     if (!detail || (!content.trim() && !opening) || stateRef.current.pending) return;
     const currentEpoch = epoch.current;
-    const attempt: Attempt = retry ? { ...retry } : { clientTurnId: crypto.randomUUID(), content: content.trim(), turnId: null };
+    const attempt: Attempt = attemptForSend(content, retry);
     controller.current?.abort();
     const stream = new AbortController();
     controller.current = stream;

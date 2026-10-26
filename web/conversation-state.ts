@@ -1,4 +1,5 @@
 import type { Message, SessionDetail, TurnEvent, TurnView } from '../shared/contracts';
+import { createClientTurnId } from './client-turn-id';
 
 export interface Attempt { clientTurnId: string; content: string; turnId: string | null; operation?: 'chat' | 'opening' }
 export interface ConversationState {
@@ -18,6 +19,11 @@ export function needsOpening(detail: SessionDetail): boolean {
   return Boolean(detail.session.dynamicOpening && !detail.hasMore && detail.messages.length === 0);
 }
 export function openingAttempt(sessionId: string): Attempt { return { clientTurnId: `opening:${sessionId}`, content: '', turnId: null, operation: 'opening' }; }
+export function attemptForSend(content: string, retry?: Attempt): Attempt {
+  // A retry (chat or opening) must keep its original idempotency key so the server can
+  // replay the same turn instead of accepting another one. Only a fresh send mints an id.
+  return retry ? { ...retry } : { clientTurnId: createClientTurnId(), content: content.trim(), turnId: null };
+}
 export function persistedOpening(detail: SessionDetail): Attempt | null {
   if (!detail.session.dynamicOpening || detail.messages.some(message => message.role === 'assistant' && message.kind !== 'operation' && (!message.status || message.status === 'committed'))) return null;
   const operation = detail.messages.find(message => message.kind === 'operation' && message.role === 'user' && message.turnId);
