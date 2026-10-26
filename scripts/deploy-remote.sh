@@ -5,6 +5,8 @@ umask 077
 app=/opt/AgenticV3
 service=agentic-v3
 account=agenticv3
+check_only=false
+if test "${1:-}" = '--check'; then check_only=true; shift; fi
 ref=${1:-origin/main}
 exec 9>/run/lock/agentic-v3-deploy.lock
 flock -n 9 || { echo 'Another deployment is running.'; exit 1; }
@@ -18,12 +20,11 @@ repo fetch origin
 target=$(repo rev-parse --verify "${ref}^{commit}")
 before=$(repo rev-parse HEAD)
 repo merge-base --is-ancestor "$before" "$target" || { echo 'Ref is not a fast-forward; no code was replaced.'; exit 1; }
-if test "$before" = "$target"; then echo "Already deployed: $target"; exit 0; fi
+if test "$before" = "$target" && ! "$check_only"; then echo "Already deployed: $target"; exit 0; fi
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 candidate=/opt/AgenticV3-candidates/$stamp
 backup=/opt/AgenticV3-backups/git-$stamp
 install -d -m700 -o "$account" -g "$account" "$candidate"
-install -d -m700 "$backup"
 repo archive "$target" | as_app tar -x -C "$candidate"
 cp -a "$app/.harness-contract" "$candidate/.harness-contract"
 cp "$app/.env" "$candidate/.env"
@@ -41,6 +42,11 @@ as_app bash -c 'cd "$1"; npm run check && npm run build' -- "$candidate"
 if test -d "$app/dist/verification"; then cp -a "$app/dist/verification" "$candidate/dist/verification"; fi
 cd "$candidate"
 as_app node --import tsx scripts/deploy-readiness.ts
+if "$check_only"; then
+  echo "Checked $target; candidate $candidate; live service and database were not changed."
+  exit 0
+fi
+install -d -m700 "$backup"
 runuser -u postgres -- pg_dump -Fc agentic_v3_demo > "$backup/database.dump"
 repo bundle create - HEAD > "$backup/source.bundle"
 printf '%s\n' "$before" > "$backup/previous-commit.txt"

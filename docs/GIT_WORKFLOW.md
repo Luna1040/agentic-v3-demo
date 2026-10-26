@@ -1,6 +1,6 @@
 # 代码仓库与服务器更新
 
-仓库公开，只包含源代码和开发文档。`.env`、`.local`、数据库、角色卡数据、聊天/审计日志、验收原文、服务器 HANDOFF 和生成构建均不提交。公开源代码不等于公开实例的登录信息和用户数据。
+公开仓库：[Luna1040/agentic-v3-demo](https://github.com/Luna1040/agentic-v3-demo)。仅包含源代码、自动化测试和开发文档。`.env`、`.local`、数据库、角色卡数据、聊天/审计日志、验收原文、服务器 HANDOFF 和生成构建均不提交。公开源代码不等于公开实例的登录信息和用户数据。
 
 第一版提交是服务器实际在运行的代码；本地 UI 改造作为未提交改动保留。提交历史不会伪造之前开发阶段的版本。Harness 保持独立工程，`harness-runtime.lock.json` 固定本应用依赖的已部署运行版本；不把完整 Harness 仓库一起公开。
 
@@ -27,6 +27,12 @@ ssh my-remote-server "bash /opt/AgenticV3/scripts/deploy-remote.sh"
 ```
 
 默认更新 `origin/main`，也可传入已推送的提交号。脚本只接受当前提交的向前更新，发现服务器源文件有改动会停止；不自动 reset 或清理文件。
+
+只检查候选版本能否构建、Harness 是否匹配及是否有活动任务，不迁移数据库、不重启服务：
+
+```powershell
+ssh my-remote-server "bash /opt/AgenticV3/scripts/deploy-remote.sh --check"
+```
 
 流程为：拉取 → 独立候选目录安装所需依赖、类型检查与构建 → 校验 Harness 锁定版本与活动任务 → 数据库和源代码备份 → 停服务后复查 → 数据库迁移 → 向前更新代码与替换构建 → 启动并检查健康。
 
