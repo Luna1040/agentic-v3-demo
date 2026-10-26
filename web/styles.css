@@ -648,6 +648,7 @@
 .agentic-app .av-trace-panel .av-call-model { font-size: 10px; margin: 7px 0; }
 .agentic-app .av-trace-panel .av-usage { font-size: 10px; }
 .agentic-app .av-trace-panel .av-call-heading strong { font-size: 10px; }
+.agentic-app .av-trace-panel .av-call-heading > span { white-space: nowrap; }
 .agentic-app .av-call-io { margin-top: 10px; }
 .agentic-app .av-call-io-label { display: block; margin: 11px 0 5px; color: #98748a; font-size: 9px; letter-spacing: .6px; }
 .agentic-app .av-call pre.av-call-io-block { max-height: none; margin: 0; padding: 9px 10px; background: #f8f3f6; border-radius: 6px; color: #6d5965; font: 11px/1.7 ui-monospace, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
