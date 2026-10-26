@@ -1,4 +1,6 @@
 * text=auto eol=lf
+# Applied migration checksums use exact file bytes; do not normalize their EOLs.
+server/migrations/*.sql -text
 *.png binary
 *.jpg binary
 *.jpeg binary
