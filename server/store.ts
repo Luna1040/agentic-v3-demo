@@ -18,6 +18,7 @@ import { appendRuntimeAudit,readRuntimeAudit,auditEntity } from './runtime-audit
 import { playerDeparture } from '../shared/scene-transition.ts';
 import { validMovementEvidence } from './movement.ts';
 import { unknownStoryTime, initialStoryTime, validStoryTime, resolveStoryTime, settlementWindow } from '../shared/story-time.ts';
+import { sceneCutRequested } from '../shared/scene-cut.ts';
 
 type Row = Record<string, any>;
 type Query = Pool | PoolClient;
@@ -1419,7 +1420,7 @@ export class StoryStore {
       const source=await this.scopedTurn(q,job.ownerId,job.turnId);
       const current={...source,input_json:row.input_json};
       const result=structuredClone(row.result) as WorldTurnResult;
-      const affectedIds=[...new Set([...(result.entityChanges??[]).map(change=>change.entity.id),...(result.actorLocations??[]).map(move=>move.characterId),...(row.offline_result?.settledCharacterIds??[]),...(!source.episode_scene.location&&result.scene?.location?source.episode_participant_ids:[])])];
+      const affectedIds=[...new Set([...(result.entityChanges??[]).map(change=>change.entity.id),...(result.actorLocations??[]).map(move=>move.characterId),...(row.offline_result?.settledCharacterIds??[]),...(result.scene?.location?source.episode_participant_ids:[])])];
       const entityRowsBefore=(await q.query('SELECT * FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND id=ANY($3::text[])',[job.ownerId,job.worldId,affectedIds])).rows;
       const eventIds=(result.eventLedger??[]).map(event=>event.id);
       const eventRowsBefore=(await q.query('SELECT id,record FROM world_story_events WHERE owner_id=$1 AND world_id=$2 AND id=ANY($3::text[])',[job.ownerId,job.worldId,eventIds])).rows;
@@ -1457,10 +1458,20 @@ export class StoryStore {
       const sceneCurrent=latest?.id===job.turnId && (world.revision===source.base_revision+1
         || latest.scene_not_newer && isDeepStrictEqual(contextScene(world.scene),contextScene(source.episode_scene)));
       const established=dialogue.attributedEvidence && !source.episode_scene.location && result.scene?.location;
-      if(sceneCurrent && (discovered.length || result.actorLocations?.length || established)) {
+      // A validated cut changes the camera without inventing a travelled route.
+      // Only the evidenced focus moves; old scene participants do not teleport.
+      const cut=dialogue.attributedEvidence && source.episode_scene.location && result.scene?.location
+        && source.episode_scene.location!==result.scene.location && sceneCutRequested(source.input_json.userText)
+        && isDeepStrictEqual(result.scene.presentCharacterIds,[source.character_id]);
+      const anchored=established || cut&&result.scene?.location;
+      if(sceneCurrent && (discovered.length || result.actorLocations?.length || anchored)) {
         sceneDisposition='applied';
         let scene=source.episode_scene;
-        if(established && await this.row(q,"SELECT id FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND kind='location' AND name=$3",[job.ownerId,job.worldId,established])){scene={...scene,location:established};await this.locateSceneActors(q,job.ownerId,job.worldId,scene,source.character_id);}
+        if(anchored && await this.row(q,"SELECT id FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND kind='location' AND name=$3 AND $4=ANY(known_by_character_ids)",[job.ownerId,job.worldId,anchored,source.character_id])) {
+          scene=cut?contextScene(result.scene!):{...scene,location:anchored};
+          if(cut)delete scene.situation;
+          await this.locateSceneActors(q,job.ownerId,job.worldId,scene,source.character_id);
+        }
         if(result.actorLocations?.length) scene=await this.applyActorLocations(q,current,scene,this.attributedReplies(dialogue,job.turnId),result.actorLocations);
         if(discovered.length && scene.mode!=='direct') {
           const staying=scene.location===source.episode_scene.location ? discovered : [];
@@ -1470,7 +1481,7 @@ export class StoryStore {
         if(world.scene?.playerPresent===false)scene.playerPresent=false;
         await q.query("UPDATE worlds SET scene=$3::jsonb || jsonb_build_object('updatedAt',clock_timestamp()) WHERE id=$1 AND owner_id=$2",[job.worldId,job.ownerId,scene]);
         await q.query('UPDATE sessions SET scene=CASE WHEN scene IS NOT NULL THEN $3 ELSE scene END WHERE id=$1 AND owner_id=$2',[source.session_id,job.ownerId,scene]);
-      } else if(result.actorLocations?.length){
+      } else if(result.actorLocations?.length || cut){
         sceneDisposition='historical';
         await q.query("UPDATE world_settlements SET result=result || '{\"movementDisposition\":\"historical_only_newer_world_state\"}'::jsonb WHERE id=$1",[job.id]);
       }
