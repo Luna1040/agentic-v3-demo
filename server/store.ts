@@ -18,6 +18,7 @@ import { appendRuntimeAudit,readRuntimeAudit,auditEntity } from './runtime-audit
 import { playerDeparture } from '../shared/scene-transition.ts';
 import { validMovementEvidence } from './movement.ts';
 import { unknownStoryTime, initialStoryTime, validStoryTime, resolveStoryTime, settlementWindow } from '../shared/story-time.ts';
+import { sceneCutRequested } from '../shared/scene-cut.ts';
 
 type Row = Record<string, any>;
 type Query = Pool | PoolClient;
@@ -1303,9 +1304,16 @@ export class StoryStore {
       return {activities:[],applied:undefined};
     }
     let applied:ReturnType<typeof resolveStoryTime>;
-    try { applied=resolveStoryTime(temporal,source.story_time ?? undefined,input.userText,source.id); }
+    try {
+      // The foreground has already committed the clock. Recompute from its
+      // frozen input, then compare the actor projection: persisted provenance
+      // retains earlier quotes that are deliberately absent from actor inputs.
+      applied=resolveStoryTime(temporal,undefined,input.userText,source.id);
+      if(!validStoryTime(source.story_time) || !isDeepStrictEqual(actorStoryTime(source.story_time),actorStoryTime(applied.story))) throw new TypeError('Committed story time differs from frozen chronology');
+    }
     catch { throw new ServiceError('ACTIVITY_INVALID','本轮离线时间依据无效。',422); }
-    if(result.storyTime && !isDeepStrictEqual(result.storyTime,applied.story)) throw new ServiceError('ACTIVITY_INVALID','后台离线结算不能改变已经发生的剧情时间。',422);
+    if(result.storyTime && (!validStoryTime(result.storyTime) || !isDeepStrictEqual(actorStoryTime(result.storyTime),actorStoryTime(applied.story)))) throw new ServiceError('ACTIVITY_INVALID','后台离线结算不能改变已经发生的剧情时间。',422);
+    applied.story=structuredClone(source.story_time);
     const activities:WorldActivity[]=[];
     for(const activity of result.activities) {
       const actor=input.worldContext?.actorInputs[activity.characterId]; const clock=actor?.worldContext?.clock;
@@ -1412,7 +1420,7 @@ export class StoryStore {
       const source=await this.scopedTurn(q,job.ownerId,job.turnId);
       const current={...source,input_json:row.input_json};
       const result=structuredClone(row.result) as WorldTurnResult;
-      const affectedIds=[...new Set([...(result.entityChanges??[]).map(change=>change.entity.id),...(result.actorLocations??[]).map(move=>move.characterId),...(row.offline_result?.settledCharacterIds??[]),...(!source.episode_scene.location&&result.scene?.location?source.episode_participant_ids:[])])];
+      const affectedIds=[...new Set([...(result.entityChanges??[]).map(change=>change.entity.id),...(result.actorLocations??[]).map(move=>move.characterId),...(row.offline_result?.settledCharacterIds??[]),...(result.scene?.location?source.episode_participant_ids:[])])];
       const entityRowsBefore=(await q.query('SELECT * FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND id=ANY($3::text[])',[job.ownerId,job.worldId,affectedIds])).rows;
       const eventIds=(result.eventLedger??[]).map(event=>event.id);
       const eventRowsBefore=(await q.query('SELECT id,record FROM world_story_events WHERE owner_id=$1 AND world_id=$2 AND id=ANY($3::text[])',[job.ownerId,job.worldId,eventIds])).rows;
@@ -1438,16 +1446,32 @@ export class StoryStore {
       await applyStoryProgress(q,job.ownerId,job.worldId,job.turnId,result.storyProgress);
       const verified=source.operation==='opening'?[]:validateChanges(result.changes,{...row.input_json,userText:observationText(observations?.[source.character_id]),turnId:source.id});
       for(const change of verified) await q.query("INSERT INTO events(id,owner_id,world_id,kind,text,visibility,character_id,source_turn_id,evidence,status) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'active')",[randomUUID(),job.ownerId,job.worldId,change.kind,change.text,change.visibility,change.characterId,job.turnId,change.evidence]);
-      const latest=await this.row(q,"SELECT id FROM turns WHERE owner_id=$1 AND world_id=$2 AND status='committed' ORDER BY seq DESC LIMIT 1",[job.ownerId,job.worldId]);
+      const latest=await this.row(q,`SELECT t.id,COALESCE((w.scene->>'updatedAt')::timestamptz<=t.updated_at,false) AS scene_not_newer
+        FROM turns t JOIN worlds w ON w.id=t.world_id AND w.owner_id=t.owner_id
+        WHERE t.owner_id=$1 AND t.world_id=$2 AND t.status='committed' ORDER BY t.seq DESC LIMIT 1`,[job.ownerId,job.worldId]);
       const discovered=(result.entityChanges??[]).filter(change=>change.op==='create' && change.entity.kind==='npc').map(change=>change.entity.id);
       // Compose both changes once. A focus move changes the camera; only a new
       // character whose recorded destination matches it is present there.
-      const sceneCurrent=latest?.id===job.turnId && world.revision===source.base_revision+1;
+      // Earlier background commits advance the world revision without moving
+      // the camera. Fence on the latest turn and actual scene edits, including
+      // a manual confirmation of identical values (compare timestamps in PG).
+      const sceneCurrent=latest?.id===job.turnId && (world.revision===source.base_revision+1
+        || latest.scene_not_newer && isDeepStrictEqual(contextScene(world.scene),contextScene(source.episode_scene)));
       const established=dialogue.attributedEvidence && !source.episode_scene.location && result.scene?.location;
-      if(sceneCurrent && (discovered.length || result.actorLocations?.length || established)) {
+      // A validated cut changes the camera without inventing a travelled route.
+      // Only the evidenced focus moves; old scene participants do not teleport.
+      const cut=dialogue.attributedEvidence && source.episode_scene.location && result.scene?.location
+        && source.episode_scene.location!==result.scene.location && sceneCutRequested(source.input_json.userText)
+        && isDeepStrictEqual(result.scene.presentCharacterIds,[source.character_id]);
+      const anchored=established || cut&&result.scene?.location;
+      if(sceneCurrent && (discovered.length || result.actorLocations?.length || anchored)) {
         sceneDisposition='applied';
         let scene=source.episode_scene;
-        if(established && await this.row(q,"SELECT id FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND kind='location' AND name=$3",[job.ownerId,job.worldId,established])){scene={...scene,location:established};await this.locateSceneActors(q,job.ownerId,job.worldId,scene,source.character_id);}
+        if(anchored && await this.row(q,"SELECT id FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND kind='location' AND name=$3 AND $4=ANY(known_by_character_ids)",[job.ownerId,job.worldId,anchored,source.character_id])) {
+          scene=cut?contextScene(result.scene!):{...scene,location:anchored};
+          if(cut)delete scene.situation;
+          await this.locateSceneActors(q,job.ownerId,job.worldId,scene,source.character_id);
+        }
         if(result.actorLocations?.length) scene=await this.applyActorLocations(q,current,scene,this.attributedReplies(dialogue,job.turnId),result.actorLocations);
         if(discovered.length && scene.mode!=='direct') {
           const staying=scene.location===source.episode_scene.location ? discovered : [];
@@ -1457,7 +1481,7 @@ export class StoryStore {
         if(world.scene?.playerPresent===false)scene.playerPresent=false;
         await q.query("UPDATE worlds SET scene=$3::jsonb || jsonb_build_object('updatedAt',clock_timestamp()) WHERE id=$1 AND owner_id=$2",[job.worldId,job.ownerId,scene]);
         await q.query('UPDATE sessions SET scene=CASE WHEN scene IS NOT NULL THEN $3 ELSE scene END WHERE id=$1 AND owner_id=$2',[source.session_id,job.ownerId,scene]);
-      } else if(result.actorLocations?.length){
+      } else if(result.actorLocations?.length || cut){
         sceneDisposition='historical';
         await q.query("UPDATE world_settlements SET result=result || '{\"movementDisposition\":\"historical_only_newer_world_state\"}'::jsonb WHERE id=$1",[job.id]);
       }

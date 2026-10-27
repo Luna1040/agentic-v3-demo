@@ -44,7 +44,7 @@ writeFileSync(buildPath, JSON.stringify(artifact, null, 2) + '\n');
 const contractDir = resolve(projectRoot, '.harness-contract');
 mkdirSync(contractDir, { recursive: true });
 for (const name of readdirSync(resolve(harnessRoot, 'dist/apps/agentic-v3'))) {
-  if (name.endsWith('.d.ts') || name === 'story-time.js')
+  if (name.endsWith('.d.ts') || name === 'story-time.js' || name === 'scene-cut.js')
     copyFileSync(resolve(harnessRoot, 'dist/apps/agentic-v3', name), resolve(contractDir, name));
 }
 writeFileSync(resolve(contractDir, 'build.json'), JSON.stringify(artifact, null, 2) + '\n');
