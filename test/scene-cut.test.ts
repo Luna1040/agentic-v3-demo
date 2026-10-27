@@ -48,3 +48,20 @@ test('host and runtime use the same bounded scene-cut request rule',()=>{
   assert(sceneCutRequested('快进到那天'));
   for(const raw of ['继续。','如果能快进到那天。','不要快进到那天。','“快进到那天。”'])assert(!sceneCutRequested(raw));
 });
+
+test('an unknown scene accepts the literal activity-center name rather than an expanded model proposal',async()=>{
+  const f=await postgresFixture({livingWorld:true});
+  try {
+    const s=await f.store.createSession('alice','lin-wan');
+    const turn=await f.store.beginTurn('alice',s.session.id,randomUUID(),'这里很吵。');
+    const text='活动中心里回荡着音乐。';
+    const dialogue:WorldTurnResult={text,replies:[{characterId:'lin-wan',characterName:'林晚',text}],changes:[],entityChanges:[],activities:[],usage:{},attributedEvidence:[],observations:{'lin-wan':turn.input.userText}};
+    await f.store.commitDialogue(turn,dialogue);const job=await f.store.claimSettlement();assert(job);
+    const evidence=sources.opsSources(job.input,dialogue.replies,[],dialogue.observations).segments.find((s:any)=>s.source==='actor');
+    const reduced=reducer.reduceEventOps({contractVersion:3,commands:[{id:'place',type:'discovery',kind:'location',key:'center',name:'学生活动中心',description:'当前场所',evidenceId:evidence.id,evidenceKind:'actual_action'}],sceneContext:{decision:'confirmed',name:'学生活动中心',evidenceId:evidence.id}},job.input,dialogue.replies,[],[],dialogue.observations);
+    assert.deepEqual(reduced.deferredCommands,[]);await f.store.saveSettlementResult(job,{...dialogue,...reduced});assert(await f.store.completeSettlement(job));
+    const world=await f.store.getWorld('alice',s.world.id);assert.equal(world.scene?.location,'活动中心');
+    const place=world.entities!.find(e=>e.kind==='location'&&e.name==='活动中心')!;assert(place);
+    assert.equal(world.entities!.find(e=>e.id==='lin-wan')!.state.locationId,place.id);assert(!world.entities!.some(e=>e.name==='学生活动中心'));
+  }finally{await f.cleanup();}
+});
