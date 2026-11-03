@@ -1,6 +1,6 @@
 import express, { type Request, type Response, type NextFunction } from 'express';
-import type { Bootstrap, TurnEvent } from '../shared/contracts.ts';
-import { ServiceError, type StoryRuntime } from './runtime.ts';
+import type { Bootstrap, ChatType, TurnEvent } from '../shared/contracts.ts';
+import { ServiceError, type OperationRuntimeResolver, type StoryRuntime } from './runtime.ts';
 import { StoryStore } from './store.ts';
 import { TurnService } from './turn-service.ts';
 import { mountDeveloper, type DeveloperOptions } from './developer.ts';
@@ -11,6 +11,9 @@ export interface AppOptions {
   /** Trusted official-app authentication adapter. The default is a loopback-only local demo identity. */
   authenticate?: (request: Request) => string | Promise<string>;
   resolveRuntime?: () => Promise<StoryRuntime>;
+  /** Builds one isolated runtime for a chat-operation turn. Plain chat never uses
+   * it; tests inject a recording fake, production defaults to the forked runtime. */
+  resolveOperationRuntime?: OperationRuntimeResolver;
   developer?: DeveloperOptions;
 }
 const route = (handler: (req: Request, res: Response) => unknown) => (req: Request, res: Response, next: NextFunction) => { Promise.resolve(handler(req, res)).catch(next); };
@@ -21,9 +24,55 @@ function text(value: unknown, field: string, max: number): string {
 function owner(res: Response): string { return res.locals.ownerId as string; }
 function id(req: Request, key: string): string { return text(req.params[key], key, 100); }
 
-export function createApp({ store, runtime, authenticate = () => 'local', resolveRuntime = async () => runtime, developer }: AppOptions) {
+/** The HTTP boundary accepts the frozen user-facing PascalCase signal and the
+ * internal lowercase one; every other value is rejected instead of defaulting. */
+const chatTypeAliases: Readonly<Record<string, ChatType>> = Object.freeze({
+  Chat: 'chat', chat: 'chat', Continue: 'continue', continue: 'continue',
+  Regenerate: 'regenerate', regenerate: 'regenerate', EditRegenerate: 'edit_regenerate', edit_regenerate: 'edit_regenerate',
+});
+const uuidValue = (value: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+/** Same literal/field shape as server/chat-operations.ts operationTurnMetadata, kept
+ * local so the HTTP boundary does not depend on the prompt module's build order. */
+function operationTurnMetadata(chatType: ChatType, targetTurnId: string | null): Record<string, unknown> {
+  return chatType === 'chat' ? {} : { chatOperation: { version: 'chat-operations-v1', chatType, targetTurnId } };
+}
+/** Strict, server-authoritative chat-operation request. Unknown body fields never
+ * influence the turn; forged question/previousResponse/ownerId are ignored because
+ * they are simply not read. */
+function turnRequest(body: Record<string, unknown> | undefined): { request: { clientTurnId: string; chatType: ChatType; content?: string; targetTurnId?: string }; chatType: ChatType; targetTurnId: string | null } {
+  const clientTurnId = text(body?.clientTurnId, '请求编号', 100);
+  const raw = body?.chatType;
+  let chatType: ChatType;
+  if (raw === undefined) chatType = 'chat';
+  else if (typeof raw === 'string' && Object.prototype.hasOwnProperty.call(chatTypeAliases, raw)) chatType = chatTypeAliases[raw];
+  else throw new ServiceError('CHAT_TYPE_INVALID', '聊天类型无效。', 422);
+  const hasContent = body?.content !== undefined;
+  const content = hasContent ? body.content : undefined;
+  if (hasContent && typeof content !== 'string') throw new ServiceError('INPUT_INVALID', '消息格式无效。', 422);
+  const rawTarget = body?.targetTurnId;
+  if (rawTarget !== undefined && (typeof rawTarget !== 'string' || !rawTarget.trim() || rawTarget.length > 100 || !uuidValue(rawTarget))) throw new ServiceError('TARGET_INVALID', '重写目标无效。', 422);
+  const targetTurnId = rawTarget as string | undefined;
+  if (chatType === 'chat') {
+    if (targetTurnId !== undefined) throw new ServiceError('CHAT_TYPE_CONFLICT', '普通聊天不能指定重写目标。', 422);
+    if (!hasContent || !(content as string).trim() || (content as string).length > 8000) throw new ServiceError('INPUT_INVALID', '消息格式无效。', 422);
+    return { request: { clientTurnId, chatType, content: content as string }, chatType, targetTurnId: null };
+  }
+  if (chatType === 'continue') {
+    if ((hasContent && content !== '') || targetTurnId !== undefined) throw new ServiceError('CHAT_TYPE_CONFLICT', '继续操作不能携带新的玩家消息或目标。', 422);
+    return { request: { clientTurnId, chatType, content: '' }, chatType, targetTurnId: null };
+  }
+  if (!targetTurnId) throw new ServiceError('TARGET_INVALID', chatType === 'regenerate' ? '重新生成需要指定目标消息。' : '编辑并重写需要指定目标消息。', 422);
+  if (chatType === 'regenerate') {
+    if (hasContent && content !== '') throw new ServiceError('CHAT_TYPE_CONFLICT', '重新生成不能携带新的玩家消息。', 422);
+    return { request: { clientTurnId, chatType, targetTurnId, content: '' }, chatType, targetTurnId };
+  }
+  if (!hasContent || !(content as string).trim() || (content as string).length > 8000) throw new ServiceError('INPUT_INVALID', '消息格式无效。', 422);
+  return { request: { clientTurnId, chatType, content: content as string, targetTurnId }, chatType, targetTurnId };
+}
+
+export function createApp({ store, runtime, authenticate = () => 'local', resolveRuntime = async () => runtime, resolveOperationRuntime, developer }: AppOptions) {
   const app = express();
-  const turns = new TurnService(store, runtime, resolveRuntime);
+  const turns = new TurnService(store, runtime, resolveRuntime, resolveOperationRuntime);
   app.disable('x-powered-by');
   app.use(express.json({ limit: '128kb' }));
   app.get('/api/health', (_req, res) => res.json({ ok: true }));
@@ -119,11 +168,20 @@ export function createApp({ store, runtime, authenticate = () => 'local', resolv
   app.post('/api/turns/:id/cancel', route(async (req, res) => res.json(await turns.cancel(owner(res), id(req, 'id')))));
   const executeTurn = (opening: boolean) => route(async (req, res) => {
     const sessionId = id(req, 'id');
-    const clientTurnId = opening ? `opening:${sessionId}` : text(req.body?.clientTurnId, '请求编号', 100);
-    const content = opening ? '为当前场景生成连贯的第一幕，保留玩家选择。' : text(req.body?.content, '消息', 8000);
     const selectedRuntime = await resolveRuntime();
-    if (opening && !selectedRuntime.runWorldTurn) throw new ServiceError('OPENING_UNAVAILABLE', '当前运行时尚未提供动态开场。', 503);
-    const turn = await store.beginTurn(owner(res), sessionId, clientTurnId, content, selectedRuntime.metadata, { operation: opening ? 'opening' : 'chat' });
+    let turn;
+    if (opening) {
+      const clientTurnId = `opening:${sessionId}`;
+      const content = '为当前场景生成连贯的第一幕，保留玩家选择。';
+      if (!selectedRuntime.runWorldTurn) throw new ServiceError('OPENING_UNAVAILABLE', '当前运行时尚未提供动态开场。', 503);
+      turn = await store.beginTurn(owner(res), sessionId, clientTurnId, content, selectedRuntime.metadata, { operation: 'opening' });
+    } else {
+      const { request, chatType, targetTurnId } = turnRequest(req.body as Record<string, unknown> | undefined);
+      // The frozen strategy identity joins the runtime metadata so a retry of the
+      // same operation turn keeps the same recovery fingerprint.
+      const metadata = { ...(selectedRuntime.metadata ?? {}), ...operationTurnMetadata(chatType, targetTurnId) };
+      turn = await store.beginTurn(owner(res), sessionId, request, metadata);
+    }
     // PostgreSQL may have waited for a world lock while this connection disappeared.
     // Persist cancellation before any model execution, even if no SSE headers were sent.
     if (res.destroyed || req.aborted) {

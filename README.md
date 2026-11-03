@@ -37,6 +37,10 @@ Prompt 开发台显示六项职责、版本、试跑与调用记录。保存和�
 
 db:import-characters 和 db:import-agents 导入旧库模板及配置；db:import-sqlite 是独立的旧 demo 导入入口。它们不会迁入旧分钟 tick。表结构以 server/migrations 为准；迁移身份与应用身份分离。密钥仅存后端忽略提交的配置。
 
+## 聊天操作
+
+最新回复支持「继续」「重写」，最新玩家消息支持「编辑并重写」；操作走独立 chatType 信号，默认发送行为不变。四种类型的语义、HTTP 错误码与幂等、世界快照/归档/后台 fence、可恢复范围与验证方式见 [聊天操作信号](docs/chat-operations.md)。历史旧轮不可重写；失败或停止时旧回复与旧世界完整保留。
+
 ## 官方应用接入
 
 前端 App 可注入 createApiClient（baseUrl、fetch、getHeaders、storageNamespace）。样式限定 .agentic-app，导航不占宿主 URL，每账号使用独立本地命名空间。

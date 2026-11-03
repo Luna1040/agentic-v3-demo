@@ -11,7 +11,17 @@ import type { StoryRuntime as HarnessRuntime, RuntimeConfig } from '../shared/ha
 // already-loaded code as the new build; a deployment restart is the safe boundary.
 const loadedBuilds = new Map<string, string>();
 
-export async function loadRuntime(overrides: { prompts?: PromptSet; promptVersions?: Partial<Record<AgentKey, number>>; readDialogue?: DialogueReader } = {}): Promise<StoryRuntime> {
+export interface RuntimeOverrides {
+  prompts?: PromptSet;
+  promptVersions?: Partial<Record<AgentKey, number>>;
+  readDialogue?: DialogueReader;
+  /** Stable identity merged into the runtime metadata before the fingerprint. Chat
+   * operations use it so the per-turn strategy version participates in the same
+   * recovery identity as prompts and the Harness build. */
+  identity?: Record<string, unknown>;
+}
+
+export async function loadRuntime(overrides: RuntimeOverrides = {}): Promise<StoryRuntime> {
   const { harnessPath } = serverSettings();
   if (!existsSync(harnessPath)) throw new Error('请先运行 npm run harness:build，生成 Harness 应用。');
   const buildPath = resolve(dirname(harnessPath), 'build.json');
@@ -27,9 +37,19 @@ export async function loadRuntime(overrides: { prompts?: PromptSet; promptVersio
   try { loaded = await import(pathToFileURL(harnessPath).href); }
   catch (error) { if (!previousBuild) loadedBuilds.delete(harnessPath); throw error; }
   const createStoryRuntime = loaded.createStoryRuntime as (config: RuntimeConfig) => HarnessRuntime;
+  return assemble(createStoryRuntime, { sourceCommit: build.sourceCommit, appSourceHash: build.appSourceHash }, overrides);
+}
+
+function assemble(
+  createStoryRuntime: (config: RuntimeConfig) => HarnessRuntime,
+  build: { sourceCommit: string; appSourceHash: string },
+  overrides: RuntimeOverrides,
+): StoryRuntime {
   const config = runtimeSettings();
   const underlying = createStoryRuntime({ ...config, ...(overrides.readDialogue ? {readDialogue:overrides.readDialogue}: {}), ...(overrides.prompts ? { prompts: overrides.prompts } : {}) });
-  const identity = { ...underlying.metadata, memoryPolicy: MEMORY_POLICY, contextPolicy: 'context-pack-on-demand-v1', sourceCommit: build.sourceCommit, appSourceHash: build.appSourceHash, ...(overrides.promptVersions ? { promptVersions: overrides.promptVersions } : {}) };
+  // Key order is fixed: the same turn (including a retry) must hash to the same
+  // fingerprint, and `identity` is the only chat-operation-specific extension.
+  const identity = { ...underlying.metadata, memoryPolicy: MEMORY_POLICY, contextPolicy: 'context-pack-on-demand-v1', sourceCommit: build.sourceCommit, appSourceHash: build.appSourceHash, ...(overrides.promptVersions ? { promptVersions: overrides.promptVersions } : {}), ...(overrides.identity ? overrides.identity : {}) };
   const metadata = Object.freeze({ ...identity, runtimeFingerprint: createHash('sha256').update(JSON.stringify(identity)).digest('hex') });
   return {
     ...('streamDialogue' in underlying ? { streamDialogue: (input: Parameters<NonNullable<StoryRuntime['streamDialogue']>>[0], options: Parameters<NonNullable<StoryRuntime['streamDialogue']>>[1]) => (underlying as HarnessRuntime & {streamDialogue: NonNullable<StoryRuntime['streamDialogue']>}).streamDialogue(input, options) } : {}),
@@ -43,6 +63,10 @@ export async function loadRuntime(overrides: { prompts?: PromptSet; promptVersio
     ...(underlying.runWorldTurn ? { runWorldTurn: (input: Parameters<NonNullable<StoryRuntime['runWorldTurn']>>[0], options: Parameters<NonNullable<StoryRuntime['runWorldTurn']>>[1]) => underlying.runWorldTurn(input, options) } : {}),
     ...(underlying.testAgent ? { testAgent: (key: AgentKey, input: Parameters<NonNullable<StoryRuntime['testAgent']>>[1], options: Parameters<NonNullable<StoryRuntime['testAgent']>>[2]) => underlying.testAgent(key, input, options) } : {}),
     prompts: underlying.prompts,
+    // A fork runs the same build-identity check again: a manifest rebuilt while a
+    // chat operation is running must fail closed instead of mixing two Harness builds.
+    fork: (options) => loadRuntime({ prompts: options.prompts, promptVersions: options.promptVersions ?? overrides.promptVersions,
+      readDialogue: overrides.readDialogue, identity: { ...(overrides.identity ?? {}), ...(options.identity ?? {}) } }),
     metadata,
     status: { provider: config.mode, model: underlying.status.model,
       harness: { loaded: true, version: underlying.status.harnessVersion }, offlineSimulation: !!underlying.runWorldTurn,

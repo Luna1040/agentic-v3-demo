@@ -2,12 +2,13 @@ import { PlayerProfiles } from './PlayerProfiles';
 import { Drawer } from './Drawer';
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from 'react';
 import { Activity, ArrowDown, ArrowLeft, ArrowUp, BookOpen, Check, ChevronRight, CircleHelp, Feather, FlaskConical, Flower2, History, LoaderCircle, LockKeyhole, Menu, MessageCircle, MoreHorizontal, Plus, RotateCcw, Search, Settings2, Sparkles, Square, Users } from 'lucide-react';
-import type { Bootstrap, Character, WorldView } from '../shared/contracts';
+import type { Bootstrap, Character, Message, WorldView } from '../shared/contracts';
 import { ApiError, createApiClient, type ApiClient, type CreateSessionInput } from './api';
 import { shouldSendOnEnter } from './conversation-state';
+import { operationPendingText, operationRetryLabel } from './chat-operations.ts';
 import { useConversation } from './use-conversation';
 import { Avatar } from './Avatar';
-import { MessageBubble } from './ChatMessage';
+import { MessageBubble, type MessageActions } from './ChatMessage';
 import { CharacterLibrary } from './CharacterLibrary';
 import { recentCharacters } from './catalog';
 import { SceneEditor, SceneStrip } from './ScenePanel';
@@ -43,6 +44,7 @@ export function App({ client = defaultClient, initialSessionId, onSessionChange,
   const [notice, setNotice] = useState('');
   const [fontSize, setFontSize] = useState(15);
   const [content, setContent] = useState('');
+  const [editing, setEditing] = useState<{ turnId: string; text: string; error: string | null } | null>(null);
   const drafts = useRef(new Map<string, string>());
   const history = useRef<HTMLDivElement>(null);
   const textarea = useRef<HTMLTextAreaElement>(null);
@@ -52,7 +54,7 @@ export function App({ client = defaultClient, initialSessionId, onSessionChange,
   const refresh = useCallback(() => {
     void client.bootstrap().then(result => { if (mounted.current) { setBootstrap(result); setBootError(''); } }).catch(error => { if (mounted.current) setBootError(error.message || '无法连接故事服务。'); });
   }, [client]);
-  const { state, send, stop, reload, loadMore, loadingMore, retrySettlements, retryingSettlement, settlementError } = useConversation(client, selectedId, refresh);
+  const { state, targets, send, stop, reload, loadMore, loadingMore, retrySettlements, retryingSettlement, settlementError, continueTurn, regenerateTurn, editRegenerateTurn, retryFailed } = useConversation(client, selectedId, refresh);
   const activeWorld = state.detail?.world;
   const { failedTurns, pendingTurns, directorPending } = worldBackgroundStatus(activeWorld);
   const unresolvedCommands = activeWorld?.settlementBacklog?.unresolvedCommands ?? 0;
@@ -62,6 +64,13 @@ export function App({ client = defaultClient, initialSessionId, onSessionChange,
   const activeCharacter = cast.find(character => character.id === state.detail?.session.characterId) || characters.find(character => character.id === state.detail?.session.characterId);
   const activeWorldId = activeWorld?.id;
   const pending = Boolean(state.pending);
+  const busy = pending || state.loading;
+  const thinkingText = state.pending?.operation === 'opening'
+    ? '开场导演正在编排这一幕'
+    : state.phase === 'planning' ? operationPendingText(state.pending?.chatType)
+    : state.phase === 'settling' ? '正在保存故事变化'
+    : state.phase === 'recovering' ? '正在确认这轮结果'
+    : (activeCharacter?.name || '角色') + ' 正在回应';
   const characterPresent = !activeWorld?.scene || !activeCharacter || activeWorld.scene.presentCharacterIds.includes(activeCharacter.id);
 
   useEffect(() => { mounted.current = true; refresh(); return () => { mounted.current = false; }; }, [refresh]);
@@ -90,6 +99,11 @@ export function App({ client = defaultClient, initialSessionId, onSessionChange,
   useEffect(() => {
     if (atBottom.current && history.current) history.current.scrollTop = history.current.scrollHeight;
   }, [state.detail?.messages, state.draft, state.loading, view]);
+  useEffect(() => {
+    // A running turn or a changed target abandons an inline edit that no longer applies.
+    setEditing(current => current && (pending || current.turnId !== targets.turnId) ? null : current);
+  }, [pending, targets.turnId]);
+  useEffect(() => { setEditing(null); }, [selectedId]);
   useEffect(() => {
     if (!notice) return;
     const timer = setTimeout(() => setNotice(''), 3500);
@@ -151,8 +165,42 @@ export function App({ client = defaultClient, initialSessionId, onSessionChange,
     setDrawer(null); setSceneBuilder({ world: activeWorld, defaults: { ...activeWorld?.scene, characterId: activeCharacter.id } });
   }
   function submit() {
-    if (!content.trim() || pending || !characterPresent || !state.detail || state.loading) return;
+    if (!content.trim() || busy || !characterPresent || !state.detail) return;
     const text = content.trim(); updateDraft(''); atBottom.current = true; void send(text);
+  }
+  function startEdit() {
+    if (busy || !targets.canRegenerate || !targets.turnId) return;
+    const message = state.detail?.messages.find(item => item.id === targets.userMessageId);
+    setEditing({ turnId: targets.turnId, text: message?.content ?? '', error: null });
+  }
+  function cancelEdit() { setEditing(null); }
+  function updateEdit(text: string) { setEditing(current => current ? { ...current, text, error: null } : current); }
+  async function saveEdit() {
+    const current = editing;
+    if (!current || busy) return;
+    const text = current.text.trim();
+    if (!text) { setEditing({ ...current, error: '消息不能为空。' }); return; }
+    if (!targets.canRegenerate || targets.turnId !== current.turnId) { setEditing({ ...current, error: '只能重写最新一轮；更早的回合不可修改。' }); return; }
+    setEditing(null); atBottom.current = true;
+    await editRegenerateTurn(current.turnId, text);
+  }
+  function retryFailedAttempt() {
+    const failed = state.failed;
+    if (!failed || busy) return;
+    if (failed.operation === 'opening' && failed.newTurnRequired) { startNextConversation(); return; }
+    void retryFailed();
+  }
+  function messageActionsFor(message: Message): MessageActions | undefined {
+    if (message.id === targets.assistantMessageId) return {
+      busy, canContinue: targets.canContinue, canRegenerate: targets.canRegenerate,
+      onContinue: () => void continueTurn(), onRegenerate: () => void regenerateTurn(),
+    };
+    if (message.id === targets.userMessageId) return {
+      busy, canEdit: targets.canRegenerate,
+      editing: editing?.turnId === targets.turnId, editDraft: editing?.text ?? '', editError: editing?.error ?? null,
+      onEditStart: startEdit, onEditCancel: cancelEdit, onEditInput: updateEdit, onEditSave: () => void saveEdit(),
+    };
+    return undefined;
   }
   async function older() {
     const element = history.current;
@@ -196,22 +244,22 @@ export function App({ client = defaultClient, initialSessionId, onSessionChange,
         <div className="av-settings"><PlayerProfiles client={client} world={state.detail?.session.id === selectedId ? activeWorld : undefined} busy={pending||state.loading||state.detail?.session.id !== selectedId} onApplied={refreshPlayerWorld} /><section><span className="av-setting-icon"><Settings2 size={20} /></span><h3>阅读偏好</h3><p>调整消息文字的大小，让长一点的故事也轻松好读。</p><label className="av-setting-row"><span>文字大小 <small>{fontSize}px</small></span><input type="range" min="13" max="19" value={fontSize} onChange={event => setFontSize(Number(event.target.value))} /></label><div className="av-reading-preview" style={{ fontSize }}>风翻过书页，而我们的故事，才刚刚开始。</div></section><section><span className="av-setting-icon"><Sparkles size={20} /></span><h3>关于这个 Demo</h3><p>一个围绕角色、对话与持续记忆的轻量实验。</p><dl><div><dt>当前运行</dt><dd>{isDemo ? '演示模式 · 固定回复生成器' : '真实模型'}</dd></div><div><dt>模型</dt><dd>{bootstrap.status.model}</dd></div><div><dt>Harness</dt><dd>{bootstrap.status.harness.loaded ? bootstrap.status.harness.version : '未加载'}</dd></div><div><dt>消息和故事</dt><dd>服务端持久保存</dd></div></dl><p className="av-settings-note">{isDemo ? '演示模式不调用真实语言模型。你看到的角色回复用于验证交互与持久化流程。' : '回复由当前配置的模型生成；故事变化以服务端确认的状态为准。'}</p></section></div>
       </> : <>
         <header className="av-chat-header"><IconButton label="打开会话列表" className="av-mobile-menu" onClick={() => setMobileLibrary(true)}><Menu size={19} /></IconButton><button className="av-character-heading" onClick={() => setView('world')}><Avatar character={activeCharacter} /><span><strong>{activeCharacter?.name || '续写你的故事'}</strong><small>{activeCharacter?.subtitle || '让每一次相遇，都有下一章'}</small></span><ChevronRight size={13} /></button><div className="av-chat-actions"><button className="av-button av-player-switch" onClick={()=>setDrawer('player')}><Users size={14}/>{activeWorld?.playerProfile?.name||'玩家身份'}</button><span className="av-runtime-badge"><span />{isDemo ? '演示模式' : '实时模型'}</span><IconButton label="开发调用记录" onClick={() => setDrawer('trace')}><Activity size={18} /></IconButton><IconButton label="查看故事状态" onClick={() => setDrawer('story')}><BookOpen size={19} /></IconButton><IconButton label="阅读设置" onClick={() => { setDrawer(null); setView('settings'); }}><MoreHorizontal size={20} /></IconButton></div></header>
-        <div className="av-context-strip"><button onClick={() => setDrawer('story')}><BookOpen size={13} /><strong>{activeWorld?.title || '故事尚未开始'}</strong><ChevronRight size={11} /></button><span className="av-context-divider" /><span title="原话记录仅统计启用且有玩家证据的记忆；互动统计当前档案中的已提交开场与对话，不包含角色声称或离线活动。">{activeWorld ? `${recordCounts.quotations} 条原话记录 · ${recordCounts.interactions} 段已保存互动` : '等待第一段对话'}</span><span className="av-context-end">{pending ? state.phase === 'planning' ? '正在准备回应…' : state.phase === 'settling' ? '正在记下这一章…' : state.phase === 'recovering' ? '正在恢复连接…' : '故事正在继续…' : '完整互动可在世界档案查看'}</span></div>
+        <div className="av-context-strip"><button onClick={() => setDrawer('story')}><BookOpen size={13} /><strong>{activeWorld?.title || '故事尚未开始'}</strong><ChevronRight size={11} /></button><span className="av-context-divider" /><span title="原话记录仅统计启用且有玩家证据的记忆；互动统计当前档案中的已提交开场与对话，不包含角色声称或离线活动。">{activeWorld ? `${recordCounts.quotations} 条原话记录 · ${recordCounts.interactions} 段已保存互动` : '等待第一段对话'}</span><span className="av-context-end">{pending ? state.phase === 'planning' ? operationPendingText(state.pending?.chatType) + '…' : state.phase === 'settling' ? '正在记下这一章…' : state.phase === 'recovering' ? '正在恢复连接…' : '故事正在继续…' : '完整互动可在世界档案查看'}</span></div>
         <SceneStrip world={activeWorld} characters={cast} busy={pending || state.loading} onEdit={() => setDrawer('scene')} />
         {!characterPresent && <div className="av-presence-notice"><span>{activeCharacter?.name}当前不在场，加入场景后即可继续交谈。</span><button onClick={() => setDrawer('scene')}>编辑场景</button></div>}
         {state.loading ? <div className="av-center-state"><LoaderCircle className="av-spin" /><p>正在找回这一章…</p></div> : !state.detail ? <div className="av-center-state"><Feather size={36} /><h2>{state.error ? '这一章暂时无法打开' : '你好，故事的另一位主角。'}</h2><p>{state.error || '选一位角色，让第一次相遇发生。'}</p><button className="av-button av-button-primary" onClick={state.error ? () => void reload() : () => { setView('characters'); }}>{state.error ? '重新加载' : '开始新的故事'}<ArrowUp size={15} /></button></div> : <>
           <div className="av-messages" ref={history} onScroll={() => { const el = history.current; if (el) { atBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80; setShowScroll(!atBottom.current); } }}>
             <div className="av-day-line"><span>故事仍在继续</span></div>
             {state.detail.hasMore && <button className="av-load-more" disabled={loadingMore} onClick={() => void older()}>{loadingMore ? <LoaderCircle size={12} className="av-spin" /> : <History size={12} />}更早的对话</button>}
-            {state.detail.messages.map(message => <MessageBubble key={message.id} message={message} currentPlayerName={activeWorld?.playerProfile?.name ?? null} character={messageCharacter(message, cast, activeCharacter)} onCopy={text => void copy(text)} />)}
+            {state.detail.messages.map(message => <MessageBubble key={message.id} message={message} currentPlayerName={activeWorld?.playerProfile?.name ?? null} character={messageCharacter(message, cast, activeCharacter)} onCopy={text => void copy(text)} actions={messageActionsFor(message)} />)}
             {state.draftMessages.map(message => <MessageBubble key={message.id} message={message} currentPlayerName={activeWorld?.playerProfile?.name ?? null} character={messageCharacter(message, cast, activeCharacter)} streaming onCopy={() => {}} />)}
-            {pending && !state.draft && <div className="av-thinking" role="status"><Avatar character={activeCharacter} /><span><i /><i /><i /></span><small>{state.phase === 'planning' ? state.pending?.operation === 'opening' ? '开场导演正在编排这一幕' : '正在准备回应' : state.phase === 'settling' ? '正在保存故事变化' : state.phase === 'recovering' ? '正在确认这轮结果' : activeCharacter?.name + ' 正在回应'}</small></div>}
+            {pending && !state.draft && <div className="av-thinking" role="status"><Avatar character={activeCharacter} /><span><i /><i /><i /></span><small>{thinkingText}</small></div>}
           </div>
           {showScroll && <button className="av-jump-bottom" onClick={() => { if (history.current) history.current.scrollTo({ top: history.current.scrollHeight, behavior: 'smooth' }); atBottom.current = true; setShowScroll(false); }}><ArrowDown size={14} />回到最新</button>}
           {state.error && <div className="av-inline-error" role="alert">{state.error}</div>}
           {(failedTurns > 0 || pendingTurns > 0 || directorPending || unresolvedCommands > 0) && <div className="av-settlement-notice" role="status"><span>{failedTurns > 0 ? `此前已完成的回复和原始互动已保存，${failedTurns} 轮世界整理待重试。可以继续聊。` : pendingTurns > 0 ? `此前已完成的回复已保存，后台正在整理 ${pendingTurns} 轮世界记录。可以继续聊。` : directorPending ? '此前已完成的回复已保存，后台正在准备后续剧情建议；与本轮回复状态无关。' : '回复已保存。'}{unresolvedCommands>0&&<small>仍有 {unresolvedCommands} 条未应用候选，原文已保留，可在世界状态中核查。候选不当作已发生事实。</small>}{settlementError && <small>{settlementError}</small>}</span>{failedTurns > 0 && <button type="button" disabled={retryingSettlement} onClick={() => void retrySettlements()}><RotateCcw size={12} className={retryingSettlement ? 'av-spin' : ''} />{retryingSettlement ? '正在重试' : '重试整理'}</button>}</div>}
-          {state.failed && <div className={'av-turn-notice ' + (state.failed.cancelled ? 'is-cancelled' : '')} role="status"><span>{state.failed.cancelled ? '已停止。本轮没有提交新的故事变化。' : state.failed.message}</span><button disabled={pending} onClick={() => state.failed!.operation === 'opening' && state.failed!.newTurnRequired ? startNextConversation() : void send(state.failed!.content, state.failed!.operation === 'opening' ? state.failed! : state.failed!.newTurnRequired ? undefined : state.failed!)}><RotateCcw size={12} />{state.failed.operation === 'opening' ? state.failed.newTurnRequired ? '重新搭建场景' : '重试开场' : state.failed.newTurnRequired ? '作为新消息发送' : '重试这一轮'}</button></div>}
-          <div className="av-composer-wrap">{activeWorld?.scene?.mode === 'observe' && <div className="av-observe-control"><span>旁观模式 · 每次只继续一幕，你也可以随时输入加入。</span><button className="av-button" disabled={pending || state.loading || !characterPresent} onClick={() => void send('继续演出。')}><Sparkles size={13} />继续演出</button></div>}<div className="av-composer-top"><span><Feather size={13} />写下故事的下一句</span><span>{content ? '草稿已保留' : '留一点空间，给想象'}</span></div><form className="av-composer" onSubmit={event => { event.preventDefault(); submit(); }}><textarea ref={textarea} value={content} onChange={event => updateDraft(event.target.value)} maxLength={8000} placeholder={`想对${activeCharacter?.name || '角色'}说些什么？`} aria-label="输入消息" disabled={pending} onKeyDown={event => { if (shouldSendOnEnter({ key: event.key, shiftKey: event.shiftKey, isComposing: event.nativeEvent.isComposing, keyCode: event.nativeEvent.keyCode })) { event.preventDefault(); submit(); } }} /><div className="av-composer-footer"><span><LockKeyhole size={12} />{pending ? state.phase === 'settling' ? '正在保存本轮结果' : '等一等，回应就快到了' : '你的故事，独立保存'}</span><div><small>Enter 发送 <b>·</b> Shift + Enter 换行</small>{pending ? <button className="av-send av-stop" type="button" aria-label="停止生成" title="停止生成" onClick={() => void stop()}><Square size={15} fill="currentColor" /></button> : <button className="av-send" type="submit" disabled={!content.trim() || !characterPresent} aria-label="发送消息" title="发送消息"><ArrowUp size={20} /></button>}</div></div></form><div className="av-composer-caption"><span>{isDemo ? '演示模式：回复由固定生成器提供' : 'AI 生成的内容可能存在偏差'}</span><span>CONTINUE YOUR STORY</span></div></div>
+          {state.failed && <div className={'av-turn-notice ' + (state.failed.cancelled ? 'is-cancelled' : '')} role="status"><span>{state.failed.cancelled ? '已停止。本轮没有提交新的故事变化。' : state.failed.message}</span>{state.failed.notRetryable ? <small>{state.failed.chatType || state.failed.operation === 'opening' ? '请按提示重新操作' : '请手动重新发送这条消息'}</small> : <button disabled={busy} onClick={retryFailedAttempt}><RotateCcw size={12} />{state.failed.operation === 'opening' ? state.failed.newTurnRequired ? '重新搭建场景' : '重试开场' : state.failed.chatType ? operationRetryLabel(state.failed.chatType) : state.failed.newTurnRequired ? '作为新消息发送' : '重试这一轮'}</button>}</div>}
+          <div className="av-composer-wrap">{activeWorld?.scene?.mode === 'observe' && <div className="av-observe-control"><span>旁观模式 · 点最新回复下方的「继续」推进一幕，也可以随时输入加入。</span></div>}<div className="av-composer-top"><span><Feather size={13} />写下故事的下一句</span><span>{content ? '草稿已保留' : '留一点空间，给想象'}</span></div><form className="av-composer" onSubmit={event => { event.preventDefault(); submit(); }}><textarea ref={textarea} value={content} onChange={event => updateDraft(event.target.value)} maxLength={8000} placeholder={`想对${activeCharacter?.name || '角色'}说些什么？`} aria-label="输入消息" disabled={pending} onKeyDown={event => { if (shouldSendOnEnter({ key: event.key, shiftKey: event.shiftKey, isComposing: event.nativeEvent.isComposing, keyCode: event.nativeEvent.keyCode })) { event.preventDefault(); submit(); } }} /><div className="av-composer-footer"><span><LockKeyhole size={12} />{pending ? state.pending?.chatType ? operationPendingText(state.pending.chatType) + '，旧内容会保留到完成后替换' : state.phase === 'settling' ? '正在保存本轮结果' : '等一等，回应就快到了' : '你的故事，独立保存'}</span><div><small>Enter 发送 <b>·</b> Shift + Enter 换行</small>{pending ? <button className="av-send av-stop" type="button" aria-label="停止生成" title="停止生成" onClick={() => void stop()}><Square size={15} fill="currentColor" /></button> : <button className="av-send" type="submit" disabled={!content.trim() || !characterPresent} aria-label="发送消息" title="发送消息"><ArrowUp size={20} /></button>}</div></div></form><div className="av-composer-caption"><span>{isDemo ? '演示模式：回复由固定生成器提供' : 'AI 生成的内容可能存在偏差'}</span><span>CONTINUE YOUR STORY</span></div></div>
         </>}
       </>}
     </main>

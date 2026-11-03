@@ -11,7 +11,7 @@ function isMainline(value:any):value is MainlineState {
   return value?.planType==='mainline' && value.version===1 && Array.isArray(value.stages) && typeof value.id==='string';
 }
 async function elapsedTurns(q:Query,ownerId:string,worldId:string,plan:MainlineState):Promise<number> {
-  return Number((await q.query(`SELECT count(*) AS n FROM turns WHERE owner_id=$1 AND world_id=$2 AND status='committed'
+  return Number((await q.query(`SELECT count(*) AS n FROM turns WHERE owner_id=$1 AND world_id=$2 AND status='committed' AND archived_at IS NULL
     AND seq>(SELECT seq FROM turns WHERE owner_id=$1 AND world_id=$2 AND id=$3)`,[ownerId,worldId,plan.basedOnTurnId])).rows[0].n);
 }
 // A durable plan spans turns. The replaceable request is only a revision demand.
@@ -62,7 +62,7 @@ export async function invalidateDirection(q:Query,ownerId:string,worldId:string,
   const invalidated=await q.query("UPDATE world_directions SET plan=CASE WHEN plan->>'planType'='mainline' THEN jsonb_set(plan,'{status}','\"abandoned\"'::jsonb) ELSE NULL END,status='pending',attempt=NULL,lease_expires_at=NULL WHERE owner_id=$1 AND world_id=$2",[ownerId,worldId]);
   if(!invalidated.rowCount)return;
   await appendRuntimeAudit(q,{ownerId,worldId,turnId:previous?.requested_turn_id,attemptId:previous?.attempt??undefined,kind:'director_superseded',data:{lane:'director',reason}});
-  const latest=(await q.query("SELECT id FROM turns WHERE owner_id=$1 AND world_id=$2 AND status='committed' ORDER BY seq DESC LIMIT 1",[ownerId,worldId])).rows[0];
+  const latest=(await q.query("SELECT id FROM turns WHERE owner_id=$1 AND world_id=$2 AND status='committed' AND archived_at IS NULL ORDER BY seq DESC LIMIT 1",[ownerId,worldId])).rows[0];
   if(latest)await requestDirection(q,ownerId,worldId,latest.id,reason);
 }
 function guard(input:ActorInput): unknown {
@@ -72,7 +72,7 @@ function guard(input:ActorInput): unknown {
 }
 export async function readPreparedDirection(q:Query,ownerId:string,input:ActorInput):Promise<unknown|undefined> {
   const {rows}=await q.query(`SELECT d.plan,d.guard,d.claimed_turn_id,
-    (SELECT id FROM turns WHERE owner_id=$1 AND world_id=$2 AND status='committed' ORDER BY seq DESC LIMIT 1) AS latest
+    (SELECT id FROM turns WHERE owner_id=$1 AND world_id=$2 AND status='committed' AND archived_at IS NULL ORDER BY seq DESC LIMIT 1) AS latest
     FROM world_directions d WHERE owner_id=$1 AND world_id=$2 AND plan IS NOT NULL`,[ownerId,input.world.id]);
   const row=rows[0];
   if(isMainline(row?.plan)) {
