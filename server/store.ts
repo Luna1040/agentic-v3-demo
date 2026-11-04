@@ -1443,7 +1443,11 @@ export class StoryStore {
       // Compose both changes once. A focus move changes the camera; only a new
       // character whose recorded destination matches it is present there.
       const sceneCurrent=latest?.id===job.turnId && world.revision===source.base_revision+1;
-      const established=dialogue.attributedEvidence && !source.episode_scene.location && result.scene?.location;
+      // WorldOps may move the current place once it has current-turn evidence.
+      // An unchanged repeat stays a no-op; a late settlement never overwrites a
+      // newer scene because sceneCurrent fences it below.
+      const established = dialogue.attributedEvidence && result.scene?.location
+        && result.scene.location !== (source.episode_scene?.location ?? null) ? result.scene.location : undefined;
       if(sceneCurrent && (discovered.length || result.actorLocations?.length || established)) {
         sceneDisposition='applied';
         let scene=source.episode_scene;

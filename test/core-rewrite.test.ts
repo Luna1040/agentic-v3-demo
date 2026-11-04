@@ -200,3 +200,29 @@ test('background NPC discovery gives self knowledge and the next real Harness sc
   assert.equal((await f.store.getTurn('alice',next.id)).assistantMessages?.length,1);
  }finally{await f.cleanup();}
 });
+
+test('world ops can move the current place once it has current narration',async()=>{
+ const f=await postgresFixture({livingWorld:true});
+ try{
+  const s=await f.store.createSession('alice','lin-wan');
+  const room=randomUUID();
+  await f.store.pool.query("INSERT INTO world_entities(owner_id,world_id,id,kind,name,description,state,known_by_character_ids) VALUES('alice',$1,$2,'location','教室','上课的教室','{}','{lin-wan}')",[s.world.id,room]);
+  const turn=await f.store.beginTurn('alice',s.session.id,randomUUID(),'我们回教室吧。');
+  const result:WorldTurnResult={text:'林晚在教室里坐下。',replies:[{characterId:'lin-wan',characterName:'林晚',text:'林晚在教室里坐下。'}],changes:[],entityChanges:[],activities:[],usage:{},scene:{...turn.input.scene!,location:'走廊'},attributedEvidence:[],observations:{'lin-wan':'我们回教室吧。'}};
+  await f.store.commitDialogue(turn,result);
+  assert.equal((await f.store.getWorld('alice',s.world.id)).scene?.location,'走廊');
+  const job=await f.store.claimSettlement();assert(job);
+  // A settlement that reports the same place stays a no-op.
+  await f.store.saveSettlementResult(job,{...result});
+  assert(await f.store.completeSettlement(job));
+  assert.equal((await f.store.getWorld('alice',s.world.id)).scene?.location,'走廊');
+  // A later turn's background review may move an already established place.
+  const next=await f.store.beginTurn('alice',s.session.id,randomUUID(),'我们坐下吧。');
+  const moved:WorldTurnResult={...result,text:'林晚在教室里坐下。',scene:{...next.input.scene!,location:'走廊'},observations:{'lin-wan':'我们坐下吧。'}};
+  await f.store.commitDialogue(next,moved);
+  const job2=await f.store.claimSettlement();assert(job2);
+  await f.store.saveSettlementResult(job2,{...moved,scene:{...moved.scene!,location:'教室'}});
+  assert(await f.store.completeSettlement(job2));
+  assert.equal((await f.store.getWorld('alice',s.world.id)).scene?.location,'教室');
+ }finally{await f.cleanup();}
+});

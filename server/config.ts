@@ -48,6 +48,8 @@ export function runtimeSettings(env: NodeJS.ProcessEnv = process.env) {
     apiKey: env.KAON_API_KEY,
     timeoutMs: integer(env.KAON_TIMEOUT_MS, 90_000, 'KAON_TIMEOUT_MS', 1000, 180_000),
     delayMs: mode === 'demo' ? 12 : undefined,
+    // Narrow scene-location agent; opt-in so existing protocol fixtures stay unchanged.
+    sceneLocator: env.SCENE_LOCATOR === 'true',
   };
 }
 export function serverSettings(env: NodeJS.ProcessEnv = process.env) {
