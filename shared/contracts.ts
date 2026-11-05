@@ -11,6 +11,7 @@ export interface SceneState { location: string | null; presentCharacterIds: stri
 export type AgentKey = 'main' | 'actor' | 'updater' | 'opening' | 'pulse' | 'arbiter';
 export interface ModelUsage { inputTokens?: number; outputTokens?: number; totalTokens?: number }
 export interface AgentCallRecord {
+  delegateKey?:import('./harness').AgentDelegateKey;
   id: string; parentId: string | null; attemptId: string; agent: AgentKey;
   status: 'running' | 'completed' | 'failed' | 'cancelled' | 'reused';
   model: string; startedAt: string; completedAt?: string;
@@ -43,6 +44,7 @@ export interface StoryEvent {
   recordedAt?: string; storyTime?: StoryTime;
 }
 export interface WorldView {
+  wikiSummaries?:Array<{characterId:string;text:string;sourceTurnId:string;updatedAt:string}>;
   mainlinePlan?: import('../.harness-contract/mainline.js').MainlinePlan;
   eventLedger?: import('../.harness-contract/event-contract.js').EventRecord[];
   eventLedgerOverflow?: {openEvents:number;omittedOpenEvents:number};

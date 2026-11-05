@@ -9,7 +9,7 @@ export class StreamInterruptedError extends Error {
 export interface RequestOptions { signal?: AbortSignal }
 export interface RuntimeAuditOptions extends RequestOptions { captureId?: string; includeCalls?: boolean }
 export interface CreateSessionInput { playerProfileId?: string | null; characterId: string; worldId?: string; dynamicOpening?: boolean; scene?: SceneState; expectedRevision?: number }
-export interface LegacyAgentCatalogEntry { key: string; name: string; responsibility: string; enabled: boolean; currentVersion: string | number | null; prompt: string; versions: { version: string | number; status: string; prompt: string; createdAt: string }[]; executionKeys: AgentKey[]; implementation: string; configuration?: { promptKey?: unknown; modelRouteId?: unknown; runtimeLimits?: unknown; config?: unknown } }
+export interface LegacyAgentCatalogEntry { key: string; name: string; responsibility: string; enabled: boolean; currentVersion: string | number | null; prompt: string; versions: { version: string | number; status: string; prompt: string; createdAt: string }[]; executionKeys: AgentKey[]; dispatchKey?:string; implementation: string; configuration?: { promptKey?: unknown; modelRouteId?: unknown; runtimeLimits?: unknown; config?: unknown } }
 export interface ApiClient {
   /** Non-secret owner/workspace storage scope supplied by the embedding host. */
   readonly storageNamespace?: string;

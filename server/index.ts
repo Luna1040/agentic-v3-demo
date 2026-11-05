@@ -6,6 +6,7 @@ import { StoryStore } from './store.ts';
 import { databaseSettings, loadLocalEnvironment, projectRoot, serverSettings } from './config.ts';
 import { createPool } from './database.ts';
 import { loadRuntime } from './load-runtime.ts';
+import { oldAgentPolicies } from './legacy-agents.ts';
 import { promptSnapshot } from './developer.ts';
 
 async function main() {
@@ -17,16 +18,17 @@ async function main() {
   try {
     // Internal capability bridge: source/world/actor are frozen by Harness, not model arguments.
     const readDialogue: NonNullable<Parameters<typeof loadRuntime>[0]>['readDialogue'] = request => store.readDialogueForSource(request);
-    const runtime = await loadRuntime({readDialogue});
+    const oldAgents=process.env.OLD_AGENT_TEAM==='false'?{enabled:false}:await oldAgentPolicies(pool);
+    const runtime = await loadRuntime({readDialogue,oldAgents});
     // Startup checks the schema using the restricted application role; migrations are a separate command.
     await pool.query('SELECT id FROM characters LIMIT 1');
     const publishedPrompts = await store.getPrompts();
     if (!runtime.prompts || Object.keys(runtime.prompts).some(key => !publishedPrompts.some(row => row.key === key))) throw new Error('请先运行 db:seed-prompts 初始化 Agent Prompt。');
     const defaults = { ...runtime.prompts };
     const app = createApp({ store, runtime,
-      resolveRuntime: async () => { const snapshot = await promptSnapshot(store, defaults); return loadRuntime({ prompts: snapshot.prompts, promptVersions: snapshot.versions, readDialogue }); },
+      resolveRuntime: async () => { const snapshot = await promptSnapshot(store, defaults); return loadRuntime({ prompts: snapshot.prompts, promptVersions: snapshot.versions, readDialogue,oldAgents }); },
       developer: { authorize: () => process.env.ENABLE_DEVELOPER_TOOLS !== 'false', defaultPrompts: defaults,
-        buildRuntime: (prompts, promptVersions) => loadRuntime({ prompts, promptVersions, readDialogue }) },
+        buildRuntime: (prompts, promptVersions) => loadRuntime({ prompts, promptVersions, readDialogue,oldAgents }) },
     });
     app.get('/health/live', (_req, res) => res.json({ ok: true }));
     app.get('/health/ready', async (_req, res) => {

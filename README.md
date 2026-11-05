@@ -1,6 +1,6 @@
 # 续章 · Agentic V3 demo
 
-从一张角色卡开始的持续角色故事。普通聊天由一个 Actor 直接流式生成一条完整场景回复，多位 NPC 在同一正文中行动和说话。后台负责记忆、事件状态与跨多轮主线。
+从一张角色卡开始的持续角色故事。默认由 Main 按职责、人物和证据派发旧 Agent 团队，再由一个 Actor 流式生成一条完整场景回复。后台分别整理记忆、物品、地点、人物、任务与约定，保留统一的证据验证与事务提交。
 
 当前核心结构与接入边界见 [ARCHITECTURE.md](docs/ARCHITECTURE.md)。旧 pipeline 文档完整保存在 [历史文档](docs/PIPELINE_HISTORY.md)，其中旧流程和测试数字不代表当前版本。
 
@@ -25,7 +25,9 @@ npm start
 
 MODEL_MODE=live 使用真实 Kaon；配置缺失拒绝启动。demo 使用明确标识的确定性夹具。KAON_MODEL 控制 Actor，KAON_MAIN_MODEL 控制 Main/Opening，KAON_UPDATER_MODEL 控制 WorldOps/Pulse/Arbiter；环境变量变更后重启。实际模型及用量以调用记录为准。
 
-Prompt 开发台显示六项职责、版本、试跑与调用记录。保存和试跑分开，试跑仍可能收费。发布脚本替换启用文本，自定义文风须先核对再迁移，不能每次启动自动发布。旧16项配置只读留档。
+Prompt 开发台保留六类兼容策略的编辑与版本；旧十六项 Prompt 从原目录读取并接入独立调度，调用记录用真实职责名称展示。保存和试跑分开，Main 试跑使用当前团队入口且不提交世界，实际模型试跑仍可能收费。自定义 Actor 文风继续保留。旧目录只读，不在每次启动时覆盖原 Prompt。
+
+`OLD_AGENT_TEAM` 默认启用；启动前须已导入全部十六项旧 Prompt（缺项会拒绝启动）。可显式设置 `OLD_AGENT_TEAM=false` 使用兼容流程。团队模式使用逐回合持久后台任务；`SCENE_LOCATOR` 开启时保留专用定位器，移动到 Main 地点任务的后台子步骤，不再同步拖住正文交付。Wiki 输出显示在世界档案的剧情页，并保留来源回合。
 
 ## 操作与数据
 

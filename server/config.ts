@@ -50,6 +50,7 @@ export function runtimeSettings(env: NodeJS.ProcessEnv = process.env) {
     delayMs: mode === 'demo' ? 12 : undefined,
     // Narrow scene-location agent; opt-in so existing protocol fixtures stay unchanged.
     sceneLocator: env.SCENE_LOCATOR === 'true',
+    oldAgents: { enabled: env.OLD_AGENT_TEAM !== 'false' },
   };
 }
 export function serverSettings(env: NodeJS.ProcessEnv = process.env) {

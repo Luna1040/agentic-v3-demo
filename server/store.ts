@@ -283,6 +283,13 @@ export class StoryStore {
   }
   private async worldView(q: Query, ownerId: string, id: string, characterId?: string, scene?: SceneState): Promise<WorldView> {
     const world = await this.scopedWorld(q, ownerId, id);
+    const wikiRows=(await q.query(`SELECT DISTINCT ON(c.record#>>'{input,characterId}') c.record#>>'{input,characterId}' AS character_id,
+      c.record#>>'{output,advice}' AS summary,c.turn_id,c.updated_at FROM agent_calls c
+      JOIN turns t ON t.id=c.turn_id AND t.owner_id=c.owner_id AND t.world_id=c.world_id AND t.status='committed'
+      WHERE c.owner_id=$1 AND c.world_id=$2 AND c.record->>'delegateKey'='wiki_summarizer' AND c.record->>'status'='completed'
+      AND ($3::text IS NULL OR c.record#>>'{input,characterId}'=$3)
+      ORDER BY c.record#>>'{input,characterId}',c.updated_at DESC,c.id DESC LIMIT 24`,[ownerId,id,characterId??null])).rows;
+    const wikiSummaries=wikiRows.filter(row=>typeof row.summary==='string'&&row.summary.trim()).map(row=>({characterId:row.character_id,text:row.summary,sourceTurnId:row.turn_id,updatedAt:iso(row.updated_at)}));
     const rows = (await q.query(`WITH candidates AS (
       SELECT e.*,t.story_time,COALESCE(e.status='active' AND ${verifiedEvidence},false) AS readable
       FROM events e JOIN turns t ON t.id=e.source_turn_id AND t.owner_id=e.owner_id AND t.world_id=e.world_id AND t.character_id=e.character_id
@@ -318,7 +325,7 @@ export class StoryStore {
     const deferredCommands=(await q.query(`SELECT j.turn_id,c.command FROM world_settlements j
       CROSS JOIN LATERAL jsonb_array_elements(COALESCE(j.result->'deferredCommands','[]')) c(command)
       WHERE j.owner_id=$1 AND j.world_id=$2 ORDER BY j.seq DESC LIMIT 100`,[ownerId,id])).rows.map(row=>({id:row.command.id,reason:row.command.reason,evidenceIds:row.command.evidenceIds,sourceTurnId:row.turn_id}));
-    return { settlements, settlementBacklog, eventLedger,eventLedgerOverflow:ledger.overflow,deferredCommands,...(direction?.plan?.planType==='mainline'?{mainlinePlan:direction.plan}:{}), ...(director ? {director}: {}), id, title: world.title, revision: world.revision, playerProfile: world.player_profile ?? null, createdAt: iso(world.created_at), events, scene: scene ?? world.scene, entities, episodes, activities, storyTime: validStoryTime(world.story_time) ? world.story_time : unknownStoryTime(), clock: this.projection(world, await this.now(q)).clock, ...(characterId ? { memoryScopeCharacterId: characterId } : {}) };
+    return { ...(wikiSummaries.length?{wikiSummaries}:{}),settlements, settlementBacklog, eventLedger,eventLedgerOverflow:ledger.overflow,deferredCommands,...(direction?.plan?.planType==='mainline'?{mainlinePlan:direction.plan}:{}), ...(director ? {director}: {}), id, title: world.title, revision: world.revision, playerProfile: world.player_profile ?? null, createdAt: iso(world.created_at), events, scene: scene ?? world.scene, entities, episodes, activities, storyTime: validStoryTime(world.story_time) ? world.story_time : unknownStoryTime(), clock: this.projection(world, await this.now(q)).clock, ...(characterId ? { memoryScopeCharacterId: characterId } : {}) };
   }
   async getWorld(ownerId: string, id: string): Promise<WorldView> { return this.transaction((q) => this.worldView(q, ownerId, id), true); }
   async runtimeAudit(ownerId:string,worldId:string,captureId?:string,includeCalls=false){
@@ -1258,7 +1265,7 @@ export class StoryStore {
   }
   async saveSettlementCall(job: SettlementJob, record: AgentCallRecord): Promise<void> {
     if (!record || record.attemptId!==job.attempt || typeof record.id!=='string' || !record.id || record.id.length>200
-      || !['updater','arbiter','pulse'].includes(record.agent) || !['running','completed','failed','cancelled','reused'].includes(record.status)
+      || !(['updater','arbiter','pulse'].includes(record.agent)||(record.agent==='main'&&['world_orchestrator','scene_conductor'].includes(record.delegateKey??''))) || !['running','completed','failed','cancelled','reused'].includes(record.status)
       || typeof record.model!=='string' || record.model.length>200 || !Number.isFinite(Date.parse(record.startedAt))) throw new ServiceError('TRACE_INVALID','后台调用记录无效。',422);
     const serialized=JSON.stringify({...record,...(job.batchedTurnIds?.length ? {batchedTurnIds:job.batchedTurnIds}: {})},(key,value)=>/^(authorization|api[-_]?key|access[-_]?token|password|secret)$/i.test(key)?'[REDACTED]':value);
     if (serialized.length>(job.batchedTurnIds && job.batchedTurnIds.length>1 ? 300000 : 80000)) throw new ServiceError('TRACE_INVALID','调用记录超过大小限制。',422);

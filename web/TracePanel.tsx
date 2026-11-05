@@ -3,7 +3,7 @@ import { Activity, ChevronRight, LoaderCircle, PanelRightClose, RotateCcw } from
 import type { Message, WorldView } from '../shared/contracts';
 import type { ApiClient } from './api';
 import { CallTrace } from './CallTrace';
-import { agentLabels } from './agent-labels';
+import { callAgentLabel } from './agent-labels';
 import { displayValue } from './trace-model';
 import { useTurnTrace } from './use-turn-trace';
 
@@ -37,7 +37,7 @@ export function TracePanel({ client, messages, pendingTurnId, settlements, direc
   const settlement = settlements?.find(job => job.turnId === id);
   const selectedDirector = director?.turnId === id ? director : undefined;
   const { trace, error, retry } = useTurnTrace(client, id, { settlementStatus: settlement?.status, directorStatus: selectedDirector?.status });
-  const agents = [...new Set(trace?.calls.map(call => call.agent) || [])];
+  const agents = [...new Set(trace?.calls.map(call => callAgentLabel(call)) || [])];
   return <aside className="av-trace-panel" aria-label="Agent 输入输出">
     <header className="av-trace-panel-head">
       <div><span className="av-eyebrow">ACTUAL AGENT CALLS</span><h2>Agent 输入输出</h2></div>
@@ -54,7 +54,7 @@ export function TracePanel({ client, messages, pendingTurnId, settlements, direc
         </div>
         <div className="av-trace-panel-status">
           {trace && <span className={'av-trace-chip is-' + trace.status}>本轮 {traceStatusLabels[trace.status]}</span>}
-          {agents.map(agent => <span key={agent} className="av-trace-agent">{agentLabels[agent] || agent}</span>)}
+          {agents.map(agent => <span key={agent} className="av-trace-agent">{agent}</span>)}
           {settlement && <span className="av-trace-chip is-backstage">世界整理 {settlementLabels[settlement.status]}{settlement.attempts > 1 ? ` · 第 ${settlement.attempts} 次` : ''}</span>}
           {selectedDirector && <span className="av-trace-chip is-backstage">主线规划 {directorLabels[selectedDirector.status]}</span>}
         </div>

@@ -84,7 +84,7 @@ export function mountDeveloper(app: Express, store: StoryStore, options: Develop
     return { ...row, label: labels[key], defaultContent: options.defaultPrompts[key]!, model: typeof model === 'string' ? model : runtime.status.model, history: await store.listPromptVersions(key) };
   }
   const supportedKeys = keys.filter(key => typeof options.defaultPrompts[key] === 'string');
-  app.get('/api/dev/agent-catalog', route(async (_req, res) => res.json({ agents: await legacyAgentCatalog(store.pool) })));
+  app.get('/api/dev/agent-catalog', route(async (_req, res) => {const snapshot=await promptSnapshot(store,options.defaultPrompts);const runtime=await options.buildRuntime(snapshot.prompts,snapshot.versions);res.json({agents:await legacyAgentCatalog(store.pool,runtime.metadata?.oldAgentTeamEnabled===true)});}));
   app.get('/api/dev/prompts', route(async (_req, res) => res.json({ prompts: await Promise.all(supportedKeys.map(config)) })));
   app.put('/api/dev/prompts/:key', route(async (req, res) => {
     const key = agentKey(req.params.key);
@@ -122,7 +122,7 @@ export function mountDeveloper(app: Express, store: StoryStore, options: Develop
       if (res.destroyed || req.aborted) return;
       let output: unknown; let usage: ModelUsage | undefined;
       if (key === 'main') {
-        const run = input.worldContext && runtime.runWorldTurn ? runtime.runWorldTurn : runtime.runTurn;
+        const run = runtime.metadata?.oldAgentTeamEnabled&&runtime.streamDialogue?runtime.streamDialogue.bind(runtime):input.worldContext && runtime.runWorldTurn ? runtime.runWorldTurn : runtime.runTurn;
         if (!run) throw new ServiceError('MAIN_UNAVAILABLE', '此运行时尚未提供 Main Agent。', 503);
         const result = await run(input, {
           attemptId: randomUUID(), signal, onTextDelta: () => {}, onCheckpoint: async () => {},

@@ -1,10 +1,12 @@
 # 当前核心结构
 
+2026-11-05 本地实现新增十六职责团队。默认宿主启用 `OLD_AGENT_TEAM`：Main 选择独立 `agent/scope/characterId`，再执行对应职责。memory/item、proposal/commitment 分开授权；旧目录真实 Prompt 只读复用，结果通过统一事件验证与宿主事务提交。调用记录保留 `delegateKey` 与真实父子关系。以下旧流程作为关闭团队时的兼容说明；当前接入与边界见 [README](../README.md)。
+
 ## 前台：一次场景回复
 
 turn-service 通过 execution-mode 选择明确的 streamDialogue 接口。宿主一次读取 ContextSnapshot，再由纯投影生成各角色背景/personality、压缩记忆、授权实体和时间信息。前台只接收本场人物包；服务保留的离场资料不能直接加入前台。
 
-一个 Actor 生成完整第三人称场景，明确人物名字和行动主体。正常首字前没有 Main、Pulse、WorldOps。确需原句时可有界调用 read_dialogue，产生续写成本，是普通单次请求的显式例外。
+一个 Actor 生成完整第三人称场景，明确人物名字和行动主体。团队模式下，Main 和选中的前置审查在演员之前执行；演员之后只有确定性交付检查，状态整理留给后台。关闭团队时，首字前没有 Main、Pulse、WorldOps。确需原句时可有界调用 read_dialogue，产生续写成本。
 
 commitDialogue 要求一条回复，保存正文、冻结输入、身份/时间来源及后台任务后立即 committed。后台失败不回滚消息。旧多 Actor 接口仅作兼容。
 
@@ -20,7 +22,7 @@ ContextSnapshot 统一读取；TurnEvidence 固定本轮来源；MemorySnapshot 
 
 ## 后台队列
 
-每世界按源回合顺序整理，最多合并三轮。新生产路径直接处理 v3 命令，不经过旧 review/patch 转换链。批内前项实体和事件以确定性投影传给后项；跨批由宿主事务与版本检查控制。
+每世界按源回合顺序整理。团队模式逐回合领取，Main/子任务分别保存检查点；兼容模式最多合并三轮。生产路径直接处理 v3 命令，不经过旧 review/patch 转换链。任务间由宿主事务、原始证据与版本检查控制。
 
 模型结果先保存检查点，再记录完成 trace。离线结果另存 receipt，避免日志失败后重复付费。依赖不变时复用结果，版本检查限定实际读取对象。失败最多自动尝试三次后等待重试；原文和任务不静默丢弃。
 

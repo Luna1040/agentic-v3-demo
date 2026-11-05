@@ -1,5 +1,21 @@
 import type { AgentKey } from '../shared/contracts.ts';
 import type { Pool } from 'pg';
+import type { OldAgentKey,OldAgentTeamConfig } from '../shared/harness.ts';
+
+/** The archive remains immutable; explicit runtime activation consumes its policies. */
+export async function oldAgentPolicies(pool:Pool):Promise<OldAgentTeamConfig>{
+  const rows=(await pool.query('SELECT key,prompt,current_version,versions FROM legacy_agent_catalog ORDER BY key')).rows;
+  const expected=Object.keys(map);
+  if(rows.length!==expected.length||rows.some(row=>!expected.includes(row.key))||new Set(rows.map(row=>row.key)).size!==16)throw new Error('OLD_AGENT_CATALOG_INCOMPLETE: import the sixteen archived policies before enabling the team');
+  const policies:NonNullable<OldAgentTeamConfig['policies']>={};
+  for(const row of rows){
+    if(typeof row.prompt!=='string'||!row.prompt.trim()||row.prompt.length>12000)throw new Error('OLD_AGENT_POLICY_INVALID');
+    const published=Array.isArray(row.versions)?row.versions.find((v:any)=>v.status==='published'&&v.prompt===row.prompt):undefined;
+    const version=Number(published?.version);if(!Number.isSafeInteger(version)||version<1)throw new Error('OLD_AGENT_PROMPT_VERSION_MISSING');
+    policies[row.key as OldAgentKey]={prompt:row.prompt,version,enabled:true};
+  }
+  return{enabled:true,policies};
+}
 
 const map: Record<string, { executionKeys: AgentKey[]; implementation: string }> = {
   phase1_actor: { executionKeys: ['actor'], implementation: '早期单角色演出由独立 Character Actor 接替；原 Prompt 留档。' },
@@ -20,7 +36,7 @@ const map: Record<string, { executionKeys: AgentKey[]; implementation: string }>
   world_orchestrator: { executionKeys: ['main', 'opening', 'pulse'], implementation: 'Harness 调度回合，宿主负责租约、检查点、权限、时钟与事务提交。' },
 };
 
-export async function legacyAgentCatalog(pool: Pool) {
+export async function legacyAgentCatalog(pool: Pool,connected=false) {
   const result = await pool.query('SELECT key,name,responsibility,enabled,current_version,prompt,versions,source FROM legacy_agent_catalog ORDER BY key');
   return result.rows.map(row => ({ key: row.key, name: row.name, responsibility: row.responsibility, enabled: row.enabled,
     currentVersion: row.current_version, prompt: row.prompt, versions: row.versions,
@@ -28,5 +44,6 @@ export async function legacyAgentCatalog(pool: Pool) {
       runtimeLimits: JSON.parse(row.source.definition.runtime_limits ?? '{}'),
       config: JSON.parse(row.source.definition.config ?? '{}') },
     ...(map[row.key] ?? { executionKeys: [], implementation: '历史定义留档；当前未连接执行路径。' }),
+    ...(map[row.key]&&connected?{dispatchKey:row.key,implementation:row.key==='world_orchestrator'?'Main 独立调度身份；选择精确职责、人物和依赖。':row.key==='delivery_formatter'?'Main 可独立调用的确定性交付检查；不改写正文、不产生模型费用。':'Main 按当前阶段独立派发此职责；保留原 Prompt 版本，输入按人物授权，候选统一校验提交。'}:{}),
   }));
 }
