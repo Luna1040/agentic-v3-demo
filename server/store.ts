@@ -5,7 +5,7 @@ import { resolveRoleplayTemplate } from '../shared/roleplay-template.ts';
 import { randomUUID, createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { Pool, PoolClient } from 'pg';
-import type { AgentCallRecord, AgentKey, Character, Message, PromptVersion, SceneState, Session, SessionDetail, StoryEvent, TurnTrace, TurnView, WorldView } from '../shared/contracts.ts';
+import type { AgentCallRecord, AgentKey, ChatType, Character, Message, PromptVersion, SceneState, Session, SessionDetail, StoryEvent, TurnOperation, TurnTrace, TurnView, WorldView } from '../shared/contracts.ts';
 import { MEMORY_POLICY, ServiceError, validateChanges, type ActorCheckpoint, type ActorInput, type ModelUsage, type WorldChange, type WorldTurnResult, type DialogueReadRequest, type DialogueReadResult } from './runtime.ts';
 import type { CreateSessionOptions, EntityChange, EpisodeMemory, SpeakerReply, WorldActivity, WorldClock, WorldEntity, Observation, ArcProvenance, ActorLocation, StoryTime, TemporalContext } from '../shared/living-world.ts';
 import { observationText, validObservation, verifiedObservationSql } from './observations.ts';
@@ -21,11 +21,50 @@ import { unknownStoryTime, initialStoryTime, validStoryTime, resolveStoryTime, s
 
 type Row = Record<string, any>;
 type Query = Pool | PoolClient;
+/**
+ * Frozen contract for the runtime-prompt task (BRIEF §2.3). These names are
+ * consumed by server/turn-service.ts + server/chat-operations.ts; keep them stable.
+ *
+ * `beginTurn` freezes, per turn:
+ *  - chatType/targetTurnId      independent chat operation signal (no client input
+ *                               is trusted beyond the validated request).
+ *  - requestHash                sha256(JSON.stringify({chatType,targetTurnId,content}))
+ *                               over normalized values; a retried clientTurnId must
+ *                               reuse the same signal or fail CLIENT_TURN_CONFLICT.
+ *  - continuation               Continue only: {turnId,text,messageId} of the newest
+ *                               committed assistant text (exact saved text).
+ *  - rewriteReference           Regenerate/EditRegenerate only: {turnId,
+ *                               previousResponse,targetUserText,snapshotId}. The
+ *                               previous response is reference data for the Actor
+ *                               prompt only; it is never part of turn.input and must
+ *                               never reach WorldOps or persisted facts.
+ *  - snapshotId                 pre-state world snapshot for this generation (a
+ *                               rewrite turn reuses its target's snapshot).
+ *
+ * `commit`/`commitDialogue` detect a rewrite from the frozen turn row and, inside
+ * the same successful transaction, restore that snapshot, fence the superseded
+ * settlement/director leases, archive the target turn+messages (archived_at), and
+ * advance the world revision monotonically. A failed/cancelled rewrite never
+ * touches the world or the old reply.
+ *
+ * WORLD_SNAPSHOT_TABLES (see createWorldSnapshot/restoreWorldSnapshot): worlds
+ * (scene, story_time, story_elapsed_ms, real_anchor_at, clock_world_ms,
+ * clock_active_ms, clock_mode, clock_rate, player_profile), sessions.scene,
+ * world_entities, world_entity_knowledge, world_memory_snapshots,
+ * world_story_events, events, world_directions (plan cursor). world.revision is
+ * never restored: it only advances.
+ */
+export interface TurnContinuation { turnId: string; text: string; messageId: string }
+export interface TurnRewriteReference { turnId: string; previousResponse: string; targetUserText: string; snapshotId: string }
+export interface BeginTurnRequest { clientTurnId: string; chatType?: ChatType; content?: string; targetTurnId?: string }
 export interface StoredTurn {
   id: string; ownerId: string; sessionId: string; worldId: string;
   status: TurnView['status']; phase: TurnView['phase']; attempt: string;
   draft: string | null; input: ActorInput; replayed: boolean;
   runtimeMetadata: Record<string, unknown>; usage: TurnUsage; checkpoint: ActorCheckpoint | null;
+  chatType: ChatType; targetTurnId: string | null; requestHash: string | null;
+  continuation: TurnContinuation | null; rewriteReference: TurnRewriteReference | null;
+  snapshotId: string | null; committedRevision: number | null;
 }
 export interface StoreOptions { leaseMs?: number; livingWorld?: boolean }
 export type TurnUsage = Partial<Record<AgentKey, ModelUsage>>;
@@ -38,7 +77,7 @@ export interface SettlementJob {
   commitContext?: CommitContext;
   offlineResult?: { activities: WorldActivity[]; settledCharacterIds: string[]; storyTime?: StoryTime } | null;
 }
-export interface CommitOptions { actorFirst?: boolean; settlement?: WorldTurnResult; scene?: SceneState; usage?: TurnUsage; replies?: SpeakerReply[]; entityChanges?: EntityChange[]; activities?: WorldActivity[]; observations?: Record<string, Observation>; actorLocations?: ActorLocation[]; storyTime?: StoryTime; settledCharacterIds?: string[] }
+export interface CommitOptions { actorFirst?: boolean; settlement?: WorldTurnResult; scene?: SceneState; usage?: TurnUsage; replies?: SpeakerReply[]; entityChanges?: EntityChange[]; activities?: WorldActivity[]; observations?: Record<string, Observation>; actorLocations?: ActorLocation[]; storyTime?: StoryTime; settledCharacterIds?: string[]; restoreSnapshotId?: string; supersedeTurnId?: string }
 const agentKeys: AgentKey[] = ['main','actor','updater','opening','pulse','arbiter'];
 // Runtime errors cross a module boundary, so instanceof ServiceError cannot
 // identify them. Preserve only known codes and our own fixed public wording;
@@ -60,6 +99,19 @@ const settlementRuntimeErrors: Readonly<Record<string,string>> = Object.freeze({
   AGENT_CANCELLED:'后台 Agent 调用已取消，原始回复已保留。',
 });
 const internalStateKeys = ['lastEncounterAt','lastEncounterStoryTime','lastSettledStoryTime','lastSettledStoryMs','lastSettledAt','lastSettledWorldMs','lastSettledActiveMs','pendingRealMs','pendingWorldMs','pendingActiveRealMs','origin','rootCharacterId','source','legacyEnsembleMemory','authoredSharedMemory','authoredCastSplitAfterSeq'];
+const chatTypes: readonly ChatType[] = ['chat','continue','regenerate','edit_regenerate'];
+const rewriteChatTypes: readonly ChatType[] = ['regenerate','edit_regenerate'];
+/** Largest saved reply that may be injected as avoid-repeat reference data. */
+const rewriteReferenceLimit = 36_000;
+/** Internal-only operation markers. They are never a player line, never reach
+ * ActorInput.userText and never become player evidence or memory. */
+const operationMessages: Readonly<Record<ChatType, string | null>> = Object.freeze({
+  chat: null, continue: '（继续）', regenerate: '（重新生成）', edit_regenerate: null,
+});
+const isChatType = (value: unknown): value is ChatType => typeof value === 'string' && (chatTypes as readonly string[]).includes(value);
+const turnOperation = (row: Row): TurnOperation => row.operation === 'opening' ? 'opening' : (isChatType(row.chat_type) ? row.chat_type : 'chat');
+const asContinuation = (value: unknown): TurnContinuation | null => value && typeof value === 'object' ? value as TurnContinuation : null;
+const asRewriteReference = (value: unknown): TurnRewriteReference | null => value && typeof value === 'object' ? value as TurnRewriteReference : null;
 const iso = (value: Date | string): string => new Date(value).toISOString();
 const uuid = (value: string) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 const contextScene = (value: SceneState): SceneState => ({ location: value.location, presentCharacterIds: [...value.presentCharacterIds], ...(value.mode ? { mode: value.mode } : {}), ...(value.situation ? { situation: value.situation } : {}), ...(value.playerPresent !== undefined ? { playerPresent: value.playerPresent } : {}) });
@@ -143,8 +195,9 @@ export class StoryStore {
   }
   private entityView(row: Row): WorldEntity { return { id: row.id, kind: row.kind, name: row.name, description: row.description, state: row.state, knownByCharacterIds: row.known_by_character_ids, sourceTurnId: row.source_turn_id ?? (row.state.origin === 'user-scene' ? 'user-scene' : 'seed'), createdAt: iso(row.created_at), updatedAt: iso(row.updated_at), version: row.version ?? 1 }; }
   private async entities(q: Query, ownerId: string, worldId: string, characterId?: string): Promise<WorldEntity[]> {
-    if (!characterId) return (await q.query('SELECT * FROM world_entities WHERE owner_id=$1 AND world_id=$2 ORDER BY created_at,id', [ownerId, worldId])).rows.map(row => this.entityView(row));
+    if (!characterId) return (await q.query('SELECT * FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND archived_at IS NULL ORDER BY created_at,id', [ownerId, worldId])).rows.map(row => this.entityView(row));
     const rows = (await q.query(`SELECT k.snapshot,k.observed_at,k.source_turn_id FROM world_entity_knowledge k
+      JOIN world_entities e ON e.owner_id=k.owner_id AND e.world_id=k.world_id AND e.id=k.entity_id AND e.archived_at IS NULL
       WHERE k.owner_id=$1 AND k.world_id=$2 AND k.character_id=$3 ORDER BY k.entity_id`, [ownerId, worldId, characterId])).rows;
     const known = rows.flatMap(row => {
       const snapshot = row.snapshot as Row;
@@ -157,7 +210,7 @@ export class StoryStore {
       return [{ ...this.entityView(visible), knowledge: { observedAt: iso(row.observed_at), sourceTurnId: row.source_turn_id } }];
     });
     // A character knows its own current state. Other people only get the version witnessed.
-    const own = await this.row(q, "SELECT * FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND id=$3 AND kind='npc'", [ownerId, worldId, characterId]);
+    const own = await this.row(q, "SELECT * FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND id=$3 AND kind='npc' AND archived_at IS NULL", [ownerId, worldId, characterId]);
     return own ? [...known.filter(entity => entity.id !== characterId), this.entityView({...own,known_by_character_ids:[...new Set([...(own.known_by_character_ids??[]),characterId])]})] : known;
   }
   private async rememberEntities(q: Query, ownerId: string, worldId: string, ids: string[], witnesses: string[], sourceTurnId: string | null = null, sceneObservation=false): Promise<void> {
@@ -171,7 +224,7 @@ export class StoryStore {
         ELSE to_jsonb(e) || jsonb_build_object('description','','state',jsonb_strip_nulls(jsonb_build_object('initial',e.state->'initial','color',e.state->'color')),'known_by_character_ids',jsonb_build_array(n.id),'knowledgeScope','identity') END,
         clock_timestamp(),$5 FROM world_entities e
       JOIN world_entities n ON n.owner_id=e.owner_id AND n.world_id=e.world_id AND n.kind='npc' AND n.id=ANY($4::text[])
-      WHERE e.owner_id=$1 AND e.world_id=$2 AND e.id=ANY($3::text[]) AND (n.id=ANY(e.known_by_character_ids) OR e.kind='npc')
+      WHERE e.owner_id=$1 AND e.world_id=$2 AND e.id=ANY($3::text[]) AND e.archived_at IS NULL AND n.archived_at IS NULL AND (n.id=ANY(e.known_by_character_ids) OR e.kind='npc')
       ON CONFLICT(world_id,character_id,entity_id) DO UPDATE SET
         version=CASE WHEN $6::boolean AND EXCLUDED.snapshot->>'kind'='location' THEN world_entity_knowledge.version ELSE EXCLUDED.version END,
         snapshot=CASE WHEN NOT $6::boolean OR EXCLUDED.character_id=EXCLUDED.entity_id THEN EXCLUDED.snapshot
@@ -198,7 +251,7 @@ export class StoryStore {
   }
   private async now(q: Query): Promise<string> { return iso((await q.query('SELECT clock_timestamp() AS now')).rows[0].now); }
   private async temporal(q: Query, ownerId: string, world: Row, scene: SceneState, at: string, actorId?: string, snapshot?: ContextSnapshot): Promise<TemporalContext> {
-    const previous = snapshot ? snapshot.previous : await this.row(q, "SELECT updated_at,episode_scene,episode_participant_ids FROM turns WHERE owner_id=$1 AND world_id=$2 AND status='committed' ORDER BY seq DESC LIMIT 1", [ownerId, world.id]);
+    const previous = snapshot ? snapshot.previous : await this.row(q, "SELECT updated_at,episode_scene,episode_participant_ids FROM turns WHERE owner_id=$1 AND world_id=$2 AND status='committed' AND archived_at IS NULL ORDER BY seq DESC LIMIT 1", [ownerId, world.id]);
     const previousTurnAt = previous ? iso(previous.updated_at) : null;
     const elapsedMs = previousTurnAt ? Math.max(0, Date.parse(at) - Date.parse(previousTurnAt)) : 0;
     const offlineEligible = scene.playerPresent === false && world.clock_mode !== 'paused';
@@ -208,7 +261,7 @@ export class StoryStore {
       settlementEligible: !!previous && (previous.episode_scene?.playerPresent === false || !previous.episode_participant_ids.includes(actorId)) };
   }
   private async episodes(q: Query, ownerId: string, worldId: string, characterId?: string, limit = 30, relevant?: { entities: WorldEntity[]; scene: SceneState }, selection?:{beforeSeq:string|number;turnIds?:string[];query?:string;excludedTurnIds?:string[]}): Promise<EpisodeMemory[]> {
-    const eligible = `SELECT * FROM turns WHERE owner_id=$1 AND world_id=$2 AND status='committed'
+    const eligible = `SELECT * FROM turns WHERE owner_id=$1 AND world_id=$2 AND status='committed' AND archived_at IS NULL
       AND ($3::text IS NULL OR $3=ANY(episode_participant_ids) OR EXISTS(SELECT 1 FROM jsonb_array_elements(activities) a WHERE a->>'characterId'=$3))
       AND ($3::text IS NULL OR NOT EXISTS(SELECT 1 FROM events e WHERE e.owner_id=turns.owner_id AND e.world_id=turns.world_id AND e.source_turn_id=turns.id AND e.status='retracted' AND (e.visibility='public' OR e.character_id=$3)))`;
     const turns = selection ? (await q.query(`${eligible} AND seq<$4
@@ -295,7 +348,7 @@ export class StoryStore {
     const events = rows.map((event): StoryEvent => ({ id: event.id, kind: event.kind, text: event.text, visibility: event.visibility, characterId: event.character_id, sourceTurnId: event.source_turn_id, createdAt: iso(event.created_at), recordedAt: iso(event.created_at), ...(validStoryTime(event.story_time) ? { storyTime: event.story_time } : {}), status: event.status, evidence: event.evidence }));
     const entities = await this.entities(q, ownerId, id);
     const episodes = await this.episodes(q, ownerId, id);
-    const activities = (await q.query("SELECT activities FROM turns WHERE owner_id=$1 AND world_id=$2 AND status='committed' AND jsonb_array_length(activities)>0 ORDER BY seq DESC LIMIT 30", [ownerId, id])).rows.reverse().flatMap(row => row.activities as WorldActivity[]);
+    const activities = (await q.query("SELECT activities FROM turns WHERE owner_id=$1 AND world_id=$2 AND status='committed' AND archived_at IS NULL AND jsonb_array_length(activities)>0 ORDER BY seq DESC LIMIT 30", [ownerId, id])).rows.reverse().flatMap(row => row.activities as WorldActivity[]);
     const settlements = (await q.query(`SELECT * FROM (
       (SELECT id,turn_id,status,attempts,error_code,error_message,updated_at,seq,result->'deferredCommands' AS candidate_commands FROM world_settlements WHERE owner_id=$1 AND world_id=$2 ORDER BY seq DESC LIMIT 49)
       UNION
@@ -303,7 +356,7 @@ export class StoryStore {
     ) jobs ORDER BY seq DESC`,[ownerId,id])).rows.map(row => ({ id: row.id, turnId: row.turn_id, status: row.status, attempts: row.attempts, unresolvedCommands:unresolvedCandidates(row.candidate_commands).length, updatedAt: iso(row.updated_at), ...(row.error_code ? { error: { code: row.error_code, message: row.error_message } } : {}) }));
     const direction=await this.row(q,'SELECT status,requested_turn_id,error_code,plan FROM world_directions WHERE owner_id=$1 AND world_id=$2',[ownerId,id]);
     if(direction?.plan?.planType==='mainline' && uuid(direction.plan.basedOnTurnId)) {
-      direction.plan={...direction.plan,elapsedTurns:Number((await q.query(`SELECT count(*) AS n FROM turns WHERE owner_id=$1 AND world_id=$2 AND status='committed'
+      direction.plan={...direction.plan,elapsedTurns:Number((await q.query(`SELECT count(*) AS n FROM turns WHERE owner_id=$1 AND world_id=$2 AND status='committed' AND archived_at IS NULL
         AND seq>(SELECT seq FROM turns WHERE owner_id=$1 AND world_id=$2 AND id=$3)`,[ownerId,id,direction.plan.basedOnTurnId])).rows[0].n)};
     }
     const backlog=(await q.query(`SELECT count(*) FILTER (WHERE j.status IN ('pending','running'))::int AS pending,
@@ -351,7 +404,7 @@ export class StoryStore {
     const name = scene.location.trim();
     const present = scene.mode === 'direct' ? scene.presentCharacterIds.filter(id => id === (focusId ?? scene.presentCharacterIds[0])) : scene.presentCharacterIds;
     const normalize = (value: string) => value.trim().normalize('NFKC').toLocaleLowerCase();
-    const places = (await q.query("SELECT id,name,known_by_character_ids FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND kind='location' ORDER BY created_at,id", [ownerId, worldId])).rows;
+    const places = (await q.query("SELECT id,name,known_by_character_ids FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND kind='location' AND archived_at IS NULL ORDER BY created_at,id", [ownerId, worldId])).rows;
     const place = places.find(row => row.id === name) ?? places.find(row => normalize(row.name) === normalize(name));
     let locationId = place?.id;
     if (place) {
@@ -368,7 +421,7 @@ export class StoryStore {
     }
     // Scene placement is a host-owned fact. A private conversation cannot move bystanders.
     if (locationId) {
-      await q.query("UPDATE world_entities SET state=state || jsonb_build_object('locationId',$4::text),version=version+1,updated_at=clock_timestamp() WHERE owner_id=$1 AND world_id=$2 AND kind='npc' AND id=ANY($3::text[]) AND state->>'locationId' IS DISTINCT FROM $4", [ownerId, worldId, present, locationId]);
+      await q.query("UPDATE world_entities SET state=state || jsonb_build_object('locationId',$4::text),version=version+1,updated_at=clock_timestamp() WHERE owner_id=$1 AND world_id=$2 AND kind='npc' AND archived_at IS NULL AND id=ANY($3::text[]) AND state->>'locationId' IS DISTINCT FROM $4", [ownerId, worldId, present, locationId]);
       // Re-entering a known room reveals its identity and visible positions,
       // never every private update made to that room or its occupants since.
       await this.rememberEntities(q,ownerId,worldId,[locationId,...present],present,null,true);
@@ -382,7 +435,7 @@ export class StoryStore {
       const world = await this.scopedWorld(q, ownerId, worldId, true);
       await this.assertWorldIdle(q, ownerId, worldId);
       if (options.expectedRevision !== undefined && options.expectedRevision !== world.revision) throw new ServiceError('WORLD_CHANGED', '故事已有新的进展，请刷新后创建场景。');
-      const entity = await this.row(q, "SELECT * FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND id=$3 AND kind='npc'", [ownerId, worldId, characterId]);
+      const entity = await this.row(q, "SELECT * FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND id=$3 AND kind='npc' AND archived_at IS NULL", [ownerId, worldId, characterId]);
       if (entity) character = { id: entity.id, name: entity.name, greeting: entity.state.greeting ?? '' };
       else if (!options.dynamicOpening && !this.livingWorld) {
         character = await this.row(q, 'SELECT * FROM characters WHERE id=$1', [characterId]);
@@ -425,8 +478,8 @@ export class StoryStore {
         const sources=await q.query("SELECT id FROM turns WHERE owner_id=$1 AND world_id=$2 AND status='committed' AND id=ANY($3::uuid[]) AND $4=ANY(episode_participant_ids)",[ownerId,worldId,sharedMemory.sourceTurnIds,world.root_character_id]);
         if(sources.rowCount!==new Set(sharedMemory.sourceTurnIds).size)throw new ServiceError('CAST_MEMORY_INVALID','共同经历来源不属于该人物的已发生场景。',422);
       }
-      const original=await this.row(q,"SELECT * FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND id=$3 AND kind='npc'",[ownerId,worldId,world.root_character_id]);
-      const existingIds=new Set((await q.query("SELECT id FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND kind='npc'",[ownerId,worldId])).rows.map(row=>row.id));
+      const original=await this.row(q,"SELECT * FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND id=$3 AND kind='npc' AND archived_at IS NULL",[ownerId,worldId,world.root_character_id]);
+      const existingIds=new Set((await q.query("SELECT id FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND kind='npc' AND archived_at IS NULL",[ownerId,worldId])).rows.map(row=>row.id));
       const splitAfterSeq=Number((await this.row(q,'SELECT COALESCE(max(seq),0) AS n FROM turns WHERE owner_id=$1 AND world_id=$2',[ownerId,worldId]))!.n);
       await this.seedEntity(q,ownerId,worldId,card!,world.root_character_id);
       for(const member of cast) {
@@ -450,22 +503,57 @@ export class StoryStore {
       return this.worldView(q,ownerId,worldId);
     });
   }
-  private messageView(row: Row): Message { return { id: row.id, turnId: row.turn_id, sessionId: row.session_id, role: row.role, content: row.content, createdAt: iso(row.created_at), status: row.turn_status === 'running' ? 'pending' : row.turn_status ?? 'committed', kind: row.kind, ...((row.player_name ?? (row.role==='user' ? row.character_name : null)) ? {playerName:row.player_name ?? row.character_name} : {}), ...(row.character_id ? { characterId: row.character_id, characterName: row.character_name } : {}) }; }
-  private async page(q: Query, ownerId: string, sessionId: string, before?: string): Promise<{ messages: Message[]; hasMore: boolean; nextBefore: string | null }> {
+  private messageView(row: Row, rewriteTurnId?: string): Message { return { id: row.id, turnId: row.turn_id, sessionId: row.session_id, role: row.role, content: row.content, createdAt: iso(row.created_at), status: row.turn_status === 'running' ? 'pending' : row.turn_status ?? 'committed', kind: row.kind, ...((row.player_name ?? (row.role==='user' ? row.character_name : null)) ? {playerName:row.player_name ?? row.character_name} : {}), ...(row.character_id ? { characterId: row.character_id, characterName: row.character_name } : {}),
+    ...(row.turn_id ? { operation: turnOperation(row) } : {}), ...(rewriteTurnId && row.turn_id === rewriteTurnId ? { rewritable: true } : {}) }; }
+  private async page(q: Query, ownerId: string, sessionId: string, before?: string, rewriteTurnId?: string): Promise<{ messages: Message[]; hasMore: boolean; nextBefore: string | null }> {
     await this.scopedSession(q, ownerId, sessionId);
     let boundary: string | null = null;
     if (before) {
       const cursor = uuid(before) ? await this.row(q, 'SELECT seq FROM messages WHERE id=$1 AND session_id=$2 AND owner_id=$3', [before, sessionId, ownerId]) : undefined;
       if (!cursor) throw new ServiceError('CURSOR_INVALID', '消息分页位置无效。', 422); boundary = cursor.seq;
     }
-    const all = (await q.query('SELECT m.*,t.status AS turn_status FROM messages m LEFT JOIN turns t ON t.id=m.turn_id AND t.owner_id=m.owner_id WHERE m.session_id=$1 AND m.owner_id=$2 AND ($3::bigint IS NULL OR m.seq<$3) ORDER BY m.seq DESC LIMIT 101', [sessionId, ownerId, boundary])).rows;
-    const hasMore = all.length > 100; const messages = all.slice(0, 100).reverse().map((row) => this.messageView(row));
+    const all = (await q.query(`SELECT m.*,t.status AS turn_status,t.operation,t.chat_type FROM messages m
+      LEFT JOIN turns t ON t.id=m.turn_id AND t.owner_id=m.owner_id
+      WHERE m.session_id=$1 AND m.owner_id=$2 AND m.archived_at IS NULL AND ($3::bigint IS NULL OR m.seq<$3)
+      ORDER BY m.seq DESC LIMIT 101`, [sessionId, ownerId, boundary])).rows;
+    const hasMore = all.length > 100; const messages = all.slice(0, 100).reverse().map((row) => this.messageView(row, rewriteTurnId));
     return { messages, hasMore, nextBefore: hasMore ? messages[0].id : null };
   }
-  async messagePage(ownerId: string, sessionId: string, before?: string) { return this.transaction((q) => this.page(q, ownerId, sessionId, before), true); }
+  /** Server-authoritative rewrite availability for this session's newest committed
+   * ordinary turn. `rewritable` is turn-local (safe to show on messages, stable
+   * across unrelated reads); `available` additionally proves the current world
+   * revision/background state still allows a rewrite. The client must never infer
+   * either from cached messages: a background settlement or a manual world edit can
+   * make the newest turn unsafe. */
+  private async rewriteAvailability(q: Query, ownerId: string, sessionId: string): Promise<{ turnId: string; rewritable: boolean; available: boolean } | undefined> {
+    const session = await this.row(q, 'SELECT world_id FROM sessions WHERE id=$1 AND owner_id=$2', [sessionId, ownerId]);
+    if (!session) return undefined;
+    const latest = await this.row(q, `SELECT t.id,t.chat_type,t.operation,t.snapshot_id,t.committed_revision,
+      (SELECT j.status FROM world_settlements j WHERE j.owner_id=t.owner_id AND j.turn_id=t.id) AS settlement_status
+      FROM turns t WHERE t.owner_id=$1 AND t.world_id=$2 AND t.session_id=$3 AND t.status='committed' AND t.archived_at IS NULL
+      ORDER BY t.seq DESC LIMIT 1`, [ownerId, session.world_id, sessionId]);
+    if (!latest) return undefined;
+    const rewritable = latest.operation === 'chat' && latest.chat_type !== 'continue'
+      && !!latest.snapshot_id && latest.committed_revision !== null && latest.committed_revision !== undefined;
+    if (!rewritable) return { turnId: latest.id, rewritable: false, available: false };
+    const worldLatest = await this.row(q, "SELECT id FROM turns WHERE owner_id=$1 AND world_id=$2 AND status='committed' AND archived_at IS NULL ORDER BY seq DESC LIMIT 1", [ownerId, session.world_id]);
+    const info = await this.row(q, `SELECT w.revision,
+      (SELECT count(*)::int FROM world_settlements j WHERE j.owner_id=w.owner_id AND j.world_id=w.id AND j.status<>'completed' AND j.turn_id<>$3) AS other_pending
+      FROM worlds w WHERE w.owner_id=$1 AND w.id=$2`, [ownerId, session.world_id, latest.id]);
+    const expected = Number(latest.committed_revision) + (latest.settlement_status === 'completed' ? 1 : 0);
+    const available = Number(info?.revision) === expected && Number(info?.other_pending) === 0 && worldLatest?.id === latest.id;
+    return { turnId: latest.id, rewritable: true, available };
+  }
+  async messagePage(ownerId: string, sessionId: string, before?: string) {
+    return this.transaction(async (q) => {
+      const rewrite = await this.rewriteAvailability(q, ownerId, sessionId);
+      return this.page(q, ownerId, sessionId, before, rewrite?.rewritable ? rewrite.turnId : undefined);
+    }, true);
+  }
   private async sessionDetail(q: Query, ownerId: string, id: string): Promise<SessionDetail> {
     const session = await this.scopedSession(q, ownerId, id);
-    return { session: this.sessionView(session), ...await this.page(q, ownerId, id), world: await this.worldView(q, ownerId, session.world_id, session.character_id, session.scene ?? undefined) };
+    const rewrite = await this.rewriteAvailability(q, ownerId, id);
+    return { session: this.sessionView(session), ...await this.page(q, ownerId, id, undefined, rewrite?.rewritable ? rewrite.turnId : undefined), world: await this.worldView(q, ownerId, session.world_id, session.character_id, session.scene ?? undefined), ...(rewrite ? { rewriteTarget: { turnId: rewrite.turnId, available: rewrite.available } } : {}) };
   }
   async getSession(ownerId: string, id: string): Promise<SessionDetail> { return this.transaction((q) => this.sessionDetail(q, ownerId, id), true); }
   private async assertWorldIdle(q: Query, ownerId: string, worldId: string): Promise<void> {
@@ -480,7 +568,7 @@ export class StoryStore {
       || (value.playerPresent !== undefined && typeof value.playerPresent !== 'boolean')
       || (value.situation !== undefined && (typeof value.situation !== 'string' || value.situation.length > 1200))) throw new ServiceError('SCENE_INVALID', '场景格式无效，最多选择六名在场角色。', 422);
     const ids = value.presentCharacterIds;
-    const rows = worldId ? await q.query("SELECT id FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND kind='npc' AND id=ANY($3::text[])", [ownerId, worldId, ids]) : await q.query('SELECT id FROM characters WHERE id=ANY($1::text[])', [ids]);
+    const rows = worldId ? await q.query("SELECT id FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND kind='npc' AND archived_at IS NULL AND id=ANY($3::text[])", [ownerId, worldId, ids]) : await q.query('SELECT id FROM characters WHERE id=ANY($1::text[])', [ids]);
     if (rows.rowCount !== ids.length) throw new ServiceError('CHARACTER_NOT_FOUND', '场景中有不存在的角色。', 422);
     return { ...contextScene(value), location: value.location?.trim() || null };
   }
@@ -579,17 +667,33 @@ export class StoryStore {
       const stored=await this.row(q,'SELECT * FROM turns WHERE owner_id=$1 AND world_id=$2 AND id=$3',[ownerId,request.worldId,request.sourceTurnId]);
       const preview=this.dialoguePreviews.get(request.sourceTurnId);
       const scopedPreview=preview?.ownerId===ownerId && preview.worldId===request.worldId ? preview : undefined;
-      const source=stored ?? (scopedPreview ? {seq:scopedPreview.beforeSeq} : undefined);
+      // Authorization must be proven before any source coordinates are read: a
+      // foreign or already-expired source has no row/preview and must fail as a
+      // scope error, never as an internal TypeError.
       const authorized=stored ? (stored.character_id===request.characterId || Object.prototype.hasOwnProperty.call(stored.input_json.worldContext?.actorInputs ?? {},request.characterId) || !!await this.row(q,"SELECT id FROM messages WHERE owner_id=$1 AND turn_id=$2 AND role='assistant' AND character_id=$3 LIMIT 1",[ownerId,stored.id,request.characterId])) : scopedPreview?.characterIds.includes(request.characterId);
       if(!authorized) throw new ServiceError('DIALOGUE_SCOPE','不能读取此角色或世界的对话。',403);
+      const sourceSeq = stored ? Number(stored.seq) : Number(scopedPreview!.beforeSeq);
+      // A rewrite turn reuses its target's pre-state, so the archive read must stop
+      // before the original rewritten turn: its superseded reply (and, for an edit,
+      // its replaced question) can never be read back as current history.
+      let readEdge = sourceSeq;
+      if (stored) {
+        const boundaryTurnId = stored.target_turn_id ?? asRewriteReference(stored.rewrite_reference)?.turnId;
+        if (boundaryTurnId) {
+          const boundary = await this.row(q,'SELECT seq FROM turns WHERE owner_id=$1 AND world_id=$2 AND id=$3',[ownerId,request.worldId,boundaryTurnId]);
+          if (boundary) readEdge = Math.min(sourceSeq, Number(boundary.seq));
+        }
+      }
       if(request.turnIds) {
         if(request.turnIds.some(id=>scopedPreview?.excludedTurnIds.includes(id))) throw new ServiceError('DIALOGUE_SCOPE','请求包含试跑开始后才完成的回合。',403);
         const rows=(await q.query(`SELECT id FROM turns WHERE owner_id=$1 AND world_id=$2 AND seq<$3 AND status='committed' AND id=ANY($4::uuid[])
-          AND ($5=ANY(episode_participant_ids) OR EXISTS(SELECT 1 FROM jsonb_array_elements(activities) a WHERE a->>'characterId'=$5))`,[ownerId,request.worldId,source!.seq,request.turnIds,request.characterId])).rows;
+          AND ($5=ANY(episode_participant_ids) OR EXISTS(SELECT 1 FROM jsonb_array_elements(activities) a WHERE a->>'characterId'=$5))`,[ownerId,request.worldId,sourceSeq,request.turnIds,request.characterId])).rows;
+        // Superseded (archived) turns resolve here only to be filtered out of the
+        // returned episodes; a never-happened or foreign turn is a scope error.
         if(rows.length!==request.turnIds.length) throw new ServiceError('DIALOGUE_SCOPE','请求包含不属于本角色的、未发生或不可用的回合。',403);
       }
       const limit=request.limit ?? 3;
-      const candidates=await this.episodes(q,ownerId,request.worldId,request.characterId,limit+1,undefined,{beforeSeq:source!.seq,turnIds:request.turnIds,query:request.query?.trim(),excludedTurnIds:scopedPreview?.excludedTurnIds});
+      const candidates=await this.episodes(q,ownerId,request.worldId,request.characterId,limit+1,undefined,{beforeSeq:readEdge,turnIds:request.turnIds,query:request.query?.trim(),excludedTurnIds:scopedPreview?.excludedTurnIds});
       const result:DialogueReadResult={episodes:[],truncated:false};
       const turns=new Set<string>();
       for(const episode of candidates.reverse()) {
@@ -617,7 +721,7 @@ export class StoryStore {
   private async visibleInput(q: Query, ownerId: string, session: Row, world: Row, turnId: string, content: string, operation: 'chat' | 'opening' = 'chat', actorId = session.character_id, includeActors = true, frozen?: { clock: WorldClock; activeMs: number; temporal?: TemporalContext }, snapshot?: ContextSnapshot): Promise<ActorInput> {
     const living = this.livingWorld || session.dynamic_opening;
     snapshot ??= living ? await loadContextSnapshot(q,ownerId,world.id) : undefined;
-    const entityRow = snapshot ? snapshot.entities.find(row=>row.id===actorId && row.kind==='npc') : await this.row(q, "SELECT * FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND id=$3 AND kind='npc'", [ownerId, world.id, actorId]);
+    const entityRow = snapshot ? snapshot.entities.find(row=>row.id===actorId && row.kind==='npc') : await this.row(q, "SELECT * FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND id=$3 AND kind='npc' AND archived_at IS NULL", [ownerId, world.id, actorId]);
     if (!entityRow) throw new ServiceError('CHARACTER_NOT_FOUND', '角色不属于这个世界。', 404);
     const character = !living && !entityRow.state.authoredCastKey ? await this.row(q, 'SELECT * FROM characters WHERE id=$1', [actorId]) : undefined;
     const profile = character ?? { id: entityRow.id, name: entityRow.name, description: entityRow.description, definition: entityRow.state.definition ?? entityRow.description, greeting: entityRow.state.greeting ?? '' };
@@ -625,10 +729,15 @@ export class StoryStore {
     const cardText = (text: unknown) => resolveRoleplayTemplate(String(text ?? ''), templateNames);
     // Materialize only authored card fields. User messages and historical evidence stay literal.
     const renderedCard = { description: cardText(profile.description), definition: cardText(profile.definition), greeting: cardText(profile.greeting) };
-    const recent = living ? [] : (await q.query("SELECT id FROM turns WHERE session_id=$1 AND owner_id=$2 AND status='committed' ORDER BY seq DESC LIMIT 12", [session.id, ownerId])).rows;
+    const recent = living ? [] : (await q.query("SELECT id,input_json FROM turns WHERE session_id=$1 AND owner_id=$2 AND status='committed' AND archived_at IS NULL ORDER BY seq DESC LIMIT 12", [session.id, ownerId])).rows;
     const groups: ActorInput['history'][] = []; let chars = 0;
     for (const turn of recent) {
-      const group = (await q.query('SELECT role,content FROM messages WHERE turn_id=$1 AND owner_id=$2 ORDER BY seq', [turn.id, ownerId])).rows as ActorInput['history'];
+      // Operation markers are host bookkeeping, never player text. A rewritten
+      // turn keeps its authoritative user text in the frozen input, so history
+      // still presents the question the new reply actually answers.
+      const group = (await q.query("SELECT role,content FROM messages WHERE turn_id=$1 AND owner_id=$2 AND kind<>'operation' AND archived_at IS NULL ORDER BY seq", [turn.id, ownerId])).rows as ActorInput['history'];
+      if (!group.some(message => message.role === 'user') && typeof turn.input_json?.userText === 'string' && turn.input_json.userText)
+        group.unshift({ role: 'user', content: turn.input_json.userText });
       const size = group.reduce((n, message) => n + message.content.length, 0);
       if (chars + size > 6000) break; groups.push(group); chars += size;
     }
@@ -645,7 +754,7 @@ export class StoryStore {
     const scene: SceneState = hears ? actualScene : { location: typeof entityRow.state.locationId === 'string' ? entityRow.state.locationId : null, presentCharacterIds: [actorId], mode: 'direct' };
     const availableIds = [...new Set([profile.id, ...scene.presentCharacterIds])];
     if (availableIds.length > 6) throw new ServiceError('SCENE_FULL', '在场角色已达六名，请先调整场景再与此角色对话。');
-    const available = snapshot ? snapshot.entities.filter(row=>row.kind==='npc' && availableIds.includes(row.id)).map(row=>({id:row.id,name:row.name})) : (await q.query("SELECT id,name FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND kind='npc' AND id=ANY($3::text[]) ORDER BY id", [ownerId, world.id, availableIds])).rows;
+    const available = snapshot ? snapshot.entities.filter(row=>row.kind==='npc' && availableIds.includes(row.id)).map(row=>({id:row.id,name:row.name})) : (await q.query("SELECT id,name FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND kind='npc' AND archived_at IS NULL AND id=ANY($3::text[]) ORDER BY id", [ownerId, world.id, availableIds])).rows;
     // Main gets the raw action to adjudicate perception. Prebuilt actor packets do not:
     // Harness supplies each actor's validated observation after its scene decision.
     const narrativeName = authorNarrativeName(entityRow.state.narrativeName);
@@ -729,25 +838,80 @@ export class StoryStore {
     }
     return input;
   }
-  private stored(row: Row, replayed: boolean): StoredTurn { return { id: row.id, ownerId: row.owner_id, sessionId: row.session_id, worldId: row.world_id, status: row.status, phase: row.phase, attempt: row.attempt, draft: row.actor_draft, input: row.input_json, replayed, runtimeMetadata: row.runtime_metadata, usage: row.usage, checkpoint: row.runtime_checkpoint }; }
-  async beginTurn(ownerId: string, sessionId: string, clientTurnId: string, content: string, metadata: Record<string, unknown> = {}, options: { operation?: 'chat' | 'opening' } = {}): Promise<StoredTurn> {
-    metadata = { ...metadata, memoryPolicy: MEMORY_POLICY };
+  private stored(row: Row, replayed: boolean): StoredTurn { return { id: row.id, ownerId: row.owner_id, sessionId: row.session_id, worldId: row.world_id, status: row.status, phase: row.phase, attempt: row.attempt, draft: row.actor_draft, input: row.input_json, replayed, runtimeMetadata: row.runtime_metadata, usage: row.usage, checkpoint: row.runtime_checkpoint,
+    chatType: isChatType(row.chat_type) ? row.chat_type : 'chat', targetTurnId: row.target_turn_id ?? null, requestHash: row.request_hash ?? null,
+    continuation: asContinuation(row.continuation), rewriteReference: asRewriteReference(row.rewrite_reference),
+    snapshotId: row.snapshot_id ?? null, committedRevision: row.committed_revision === null || row.committed_revision === undefined ? null : Number(row.committed_revision) }; }
+  async beginTurn(ownerId: string, sessionId: string, clientTurnId: string, content: string, metadata?: Record<string, unknown>, options?: { operation?: 'chat' | 'opening' }): Promise<StoredTurn>;
+  async beginTurn(ownerId: string, sessionId: string, request: BeginTurnRequest, metadata?: Record<string, unknown>): Promise<StoredTurn>;
+  // Permissive overload keeps `store.beginTurn.bind(store)` and spread-argument
+  // call sites (existing tests, wrappers) assignable; it is never the public shape
+  // a caller should prefer.
+  async beginTurn(ownerId: string, sessionId: string, request: any, contentOrMetadata?: any, metadata?: any, options?: any): Promise<StoredTurn>;
+  async beginTurn(ownerId: string, sessionId: string, requestOrId: string | BeginTurnRequest, contentOrMetadata: string | Record<string, unknown> = {}, metadata: Record<string, unknown> = {}, options: { operation?: 'chat' | 'opening' } = {}): Promise<StoredTurn> {
+    // Two call shapes stay supported: the historical positional arguments and the
+    // chat-operation request object. Both freeze exactly the same fields.
+    let clientTurnId: string;
+    let chatType: ChatType;
+    let content: string;
+    let targetTurnId: string | undefined;
+    let turnMetadata: Record<string, unknown>;
+    let operation: 'chat' | 'opening';
+    if (typeof requestOrId === 'string') {
+      if (typeof contentOrMetadata !== 'string') throw new ServiceError('INPUT_INVALID', '消息格式无效。', 422);
+      clientTurnId = requestOrId; chatType = 'chat'; content = contentOrMetadata; targetTurnId = undefined;
+      turnMetadata = metadata; operation = options.operation ?? 'chat';
+    } else {
+      const request = requestOrId;
+      if (!request || typeof request !== 'object') throw new ServiceError('INPUT_INVALID', '请求格式无效。', 422);
+      if (request.chatType !== undefined && !isChatType(request.chatType)) throw new ServiceError('CHAT_TYPE_INVALID', '聊天类型无效。', 422);
+      if (request.content !== undefined && typeof request.content !== 'string') throw new ServiceError('INPUT_INVALID', '消息格式无效。', 422);
+      if (request.targetTurnId !== undefined && (typeof request.targetTurnId !== 'string' || !request.targetTurnId || request.targetTurnId.length > 100)) throw new ServiceError('TARGET_INVALID', '重写目标无效。', 422);
+      clientTurnId = request.clientTurnId; chatType = isChatType(request.chatType) ? request.chatType : 'chat';
+      content = typeof request.content === 'string' ? request.content : ''; targetTurnId = request.targetTurnId;
+      turnMetadata = (contentOrMetadata && typeof contentOrMetadata === 'object' && !Array.isArray(contentOrMetadata) ? contentOrMetadata : {}) as Record<string, unknown>;
+      operation = 'chat';
+    }
+    if (typeof clientTurnId !== 'string' || !clientTurnId.trim() || clientTurnId.length > 100) throw new ServiceError('INPUT_INVALID', '请求编号格式无效。', 422);
+    if (chatType === 'continue') {
+      if (content.trim() || targetTurnId !== undefined) throw new ServiceError('CHAT_TYPE_CONFLICT', '继续操作不能携带新的玩家消息或目标。', 422);
+    } else if (chatType === 'regenerate') {
+      if (content.trim()) throw new ServiceError('CHAT_TYPE_CONFLICT', '重新生成不能携带新的玩家消息。', 422);
+      if (!targetTurnId) throw new ServiceError('TARGET_INVALID', '重新生成需要指定目标消息。', 422);
+    } else if (chatType === 'edit_regenerate') {
+      if (!targetTurnId) throw new ServiceError('TARGET_INVALID', '编辑并重写需要指定目标消息。', 422);
+      if (!content.trim() || content.length > 8000) throw new ServiceError('INPUT_INVALID', '消息格式无效。', 422);
+    } else if (operation === 'chat') {
+      if (!content.trim() || content.length > 8000) throw new ServiceError('INPUT_INVALID', '消息格式无效。', 422);
+      if (targetTurnId !== undefined) throw new ServiceError('CHAT_TYPE_CONFLICT', '普通聊天不能指定重写目标。', 422);
+    } else if (targetTurnId !== undefined) throw new ServiceError('CHAT_TYPE_CONFLICT', '开场不能指定重写目标。', 422);
+    let effectiveMetadata = { ...turnMetadata, memoryPolicy: MEMORY_POLICY };
     return this.transaction(async (q) => {
       const session = await this.scopedSession(q, ownerId, sessionId);
       const world = await this.scopedWorld(q, ownerId, session.world_id, true);
       await this.expireWorld(q, ownerId, world.id);
       const hash = createHash('sha256').update(content).digest('hex');
+      // The idempotency identity is the frozen operation signal, never client
+      // free-text beyond the authoritative content of this request.
+      const requestHash = createHash('sha256').update(JSON.stringify({ chatType, targetTurnId: targetTurnId ?? null,
+        content: chatType === 'chat' || chatType === 'edit_regenerate' ? content : null })).digest('hex');
       let previous = await this.row(q, 'SELECT * FROM turns WHERE session_id=$1 AND owner_id=$2 AND client_turn_id=$3', [sessionId, ownerId, clientTurnId]);
       let restartingOpening = false;
-      const operation = options.operation ?? 'chat';
       if (!['chat','opening'].includes(operation) || (operation === 'opening' && (!session.dynamic_opening || clientTurnId !== `opening:${sessionId}`))) throw new ServiceError('OPENING_INVALID', '开场请求无效。', 422);
       if (previous) {
-        if (previous.content_hash !== hash || previous.operation !== operation) throw new ServiceError('CLIENT_TURN_CONFLICT', '此请求编号已用于另一条消息。');
+        const previousChatType: ChatType = isChatType(previous.chat_type) ? previous.chat_type : 'chat';
+        // A retried clientTurnId must reproduce the same frozen request. Rows that
+        // predate migration 018 have no request_hash; they are still comparable
+        // through the historical content hash and must stay plain chat.
+        const sameRequest = previous.request_hash
+          ? previous.request_hash === requestHash && previousChatType === chatType && (previous.target_turn_id ?? null) === (targetTurnId ?? null)
+          : chatType === 'chat' && targetTurnId === undefined && previous.content_hash === hash && previousChatType === 'chat';
+        if (!sameRequest || previous.operation !== operation) throw new ServiceError('CLIENT_TURN_CONFLICT', '此请求编号已用于另一条消息。');
         if (previous.status === 'committed') return this.stored(previous, true);
         if (previous.status === 'running') throw new ServiceError('TURN_RUNNING', '这条消息仍在处理中，请稍后恢复。');
-        const configChanged=!isDeepStrictEqual(previous.runtime_metadata,JSON.parse(JSON.stringify(metadata)));
+        const configChanged=!isDeepStrictEqual(previous.runtime_metadata,JSON.parse(JSON.stringify(effectiveMetadata)));
         const contextChanged=previous.base_revision!==world.revision;
-        if(operation==='chat' && (configChanged||contextChanged)) {
+        if (previousChatType === 'chat' && operation === 'chat' && (configChanged||contextChanged)) {
           // Failed transport diagnostics and successful reads are not an Actor result.
           const hasResult=previous.actor_draft!==null || previous.runtime_checkpoint!==null || await this.row(q,
             `SELECT id FROM agent_calls WHERE owner_id=$1 AND turn_id=$2 AND (record->>'status' IN ('completed','reused') OR
@@ -765,7 +929,12 @@ export class StoryStore {
           previous=(await q.query(`UPDATE turns SET runtime_history=runtime_history || jsonb_build_array(jsonb_build_object(
             'attemptId',attempt,'runtimeMetadata',runtime_metadata,'input',input_json,'baseRevision',base_revision,
             'status',status,'errorCode',error_code,'errorMessage',error_message,'recordedAt',clock_timestamp())),
-            runtime_metadata=$3,input_json=$4,base_revision=$5,clock_snapshot=$6 WHERE owner_id=$1 AND id=$2 RETURNING *`,[ownerId,previous.id,metadata,refreshed,world.revision,projected])).rows[0];
+            runtime_metadata=$3,input_json=$4,base_revision=$5,clock_snapshot=$6,request_hash=COALESCE(request_hash,$7) WHERE owner_id=$1 AND id=$2 RETURNING *`,[ownerId,previous.id,effectiveMetadata,refreshed,world.revision,projected,requestHash])).rows[0];
+        } else if (previousChatType !== 'chat') {
+          // Continue/rewrite retries never rebuild the frozen operation context:
+          // same request => same reference data and prompt.
+          if (configChanged) throw new ServiceError('RUNTIME_CHANGED', '运行配置已更新，请重新发起本轮操作。');
+          if (contextChanged) throw new ServiceError('WORLD_CHANGED', '故事已有新的进展，请重新发起本轮操作。');
         } else if(configChanged) {
           if(previous.base_revision!==world.revision)throw new ServiceError('WORLD_CHANGED','故事已有新的进展，请新建会话生成开场。');
           await q.query('UPDATE turns SET client_turn_id=$3 WHERE id=$1 AND owner_id=$2',[previous.id,ownerId,`${clientTurnId}:archived:${previous.id}`]);
@@ -777,17 +946,243 @@ export class StoryStore {
       if (previous && previous.base_revision !== world.revision) throw new ServiceError('WORLD_CHANGED', '故事已有新的进展，请作为新消息重新发送。');
       await pauseDirectionForTurn(q,ownerId,world.id);
       const attempt = randomUUID();
-      const initialPhase = operation==='opening' || metadata.orchestration && metadata.orchestration!=='scene-actor-first-v1' ? 'planning' : 'responding';
+      const initialPhase = operation==='opening' || chatType !== 'chat' || metadata.orchestration && metadata.orchestration!=='scene-actor-first-v1' ? 'planning' : 'responding';
       if (previous) {
         const row = (await q.query("UPDATE turns SET status='running',phase=$3,attempt=$4,lease_expires_at=clock_timestamp()+$5*interval '1 millisecond',error_code=NULL,error_message=NULL,updated_at=clock_timestamp() WHERE id=$1 AND owner_id=$2 RETURNING *", [previous.id, ownerId, previous.actor_draft ? 'settling' : initialPhase, attempt, this.leaseMs])).rows[0];
         return this.stored(row, true);
       }
-      const id = randomUUID(); const projected = this.projection(world, await this.now(q));
-      const input = await this.visibleInput(q, ownerId, session, world, id, content, operation, session.character_id, true, projected);
-      const row = (await q.query("INSERT INTO turns(id,owner_id,world_id,session_id,character_id,client_turn_id,content_hash,status,phase,base_revision,input_json,runtime_metadata,attempt,lease_expires_at,operation,clock_snapshot) VALUES($1,$2,$3,$4,$5,$6,$7,'running',$13,$8,$9,$10,$11,clock_timestamp()+$12*interval '1 millisecond',$14,$15) RETURNING *", [id, ownerId, world.id, sessionId, session.character_id, clientTurnId, hash, world.revision, input, metadata, attempt, this.leaseMs, initialPhase, operation, projected])).rows[0];
-      await q.query("INSERT INTO messages(id,owner_id,world_id,session_id,turn_id,role,content,kind,character_name,player_name) VALUES($1,$2,$3,$4,$5,'user',$6,$7,$8,$8)", [randomUUID(), ownerId, world.id, sessionId, id, content, operation === 'opening' ? 'operation' : 'dialogue',world.player_profile?.name ?? null]);
+      const id = randomUUID();
+      let input: ActorInput;
+      let projected: { clock: WorldClock; activeMs: number };
+      let snapshotId: string | null;
+      let continuation: TurnContinuation | null = null;
+      let rewriteReference: TurnRewriteReference | null = null;
+      let userContent: string;
+      let userKind: 'dialogue' | 'operation';
+      if (chatType === 'continue') {
+        continuation = await this.continuationTarget(q, ownerId, world.id);
+        projected = this.projection(world, await this.now(q));
+        input = await this.visibleInput(q, ownerId, session, world, id, '', operation, session.character_id, true, projected);
+        snapshotId = await this.createWorldSnapshot(q, ownerId, world, sessionId, id);
+        userContent = operationMessages.continue!; userKind = 'operation';
+      } else if (rewriteChatTypes.includes(chatType)) {
+        const target = await this.rewriteTarget(q, ownerId, world, sessionId, targetTurnId!);
+        rewriteReference = { turnId: target.turn.id, previousResponse: target.previousResponse,
+          targetUserText: chatType === 'edit_regenerate' ? content : target.targetUserText, snapshotId: target.snapshotId };
+        input = this.rewriteInput(target.turn, id, rewriteReference.targetUserText, world);
+        projected = target.turn.clock_snapshot;
+        snapshotId = target.snapshotId;
+        userContent = chatType === 'regenerate' ? operationMessages.regenerate! : content;
+        userKind = chatType === 'regenerate' ? 'operation' : 'dialogue';
+      } else {
+        projected = this.projection(world, await this.now(q));
+        input = await this.visibleInput(q, ownerId, session, world, id, content, operation, session.character_id, true, projected);
+        snapshotId = await this.createWorldSnapshot(q, ownerId, world, sessionId, id);
+        userContent = content; userKind = operation === 'opening' ? 'operation' : 'dialogue';
+      }
+      const row = (await q.query(`INSERT INTO turns(id,owner_id,world_id,session_id,character_id,client_turn_id,content_hash,status,phase,base_revision,input_json,runtime_metadata,attempt,lease_expires_at,operation,clock_snapshot,chat_type,target_turn_id,request_hash,continuation,rewrite_reference,snapshot_id)
+        VALUES($1,$2,$3,$4,$5,$6,$7,'running',$13,$8,$9,$10,$11,clock_timestamp()+$12*interval '1 millisecond',$14,$15,$16,$17,$18,$19,$20,$21) RETURNING *`,
+        [id, ownerId, world.id, sessionId, session.character_id, clientTurnId, hash, world.revision, input, effectiveMetadata, attempt, this.leaseMs, initialPhase, operation, projected,
+          chatType, targetTurnId ?? null, requestHash, continuation, rewriteReference, snapshotId])).rows[0];
+      await q.query("INSERT INTO messages(id,owner_id,world_id,session_id,turn_id,role,content,kind,character_name,player_name) VALUES($1,$2,$3,$4,$5,'user',$6,$7,$8,$8)", [randomUUID(), ownerId, world.id, sessionId, id, userContent, userKind, world.player_profile?.name ?? null]);
       return this.stored(row, false);
     });
+  }
+  /** Continue target: newest committed world turn's newest saved assistant text. */
+  private async continuationTarget(q: Query, ownerId: string, worldId: string): Promise<TurnContinuation> {
+    const latest = await this.row(q, "SELECT id FROM turns WHERE owner_id=$1 AND world_id=$2 AND status='committed' AND archived_at IS NULL ORDER BY seq DESC LIMIT 1", [ownerId, worldId]);
+    if (!latest) throw new ServiceError('NO_CONTINUATION_TARGET', '还没有可以承接的回复。', 409);
+    const message = await this.row(q, "SELECT id,content FROM messages WHERE owner_id=$1 AND turn_id=$2 AND role='assistant' AND archived_at IS NULL ORDER BY seq DESC LIMIT 1", [ownerId, latest.id]);
+    if (!message) throw new ServiceError('NO_CONTINUATION_TARGET', '还没有可以承接的回复。', 409);
+    return { turnId: latest.id, text: message.content, messageId: message.id };
+  }
+  /** Server-authoritative rewrite target of the newest committed ordinary turn. */
+  private async rewriteTarget(q: Query, ownerId: string, world: Row, sessionId: string, targetTurnId: string): Promise<{ turn: Row; previousResponse: string; targetUserText: string; snapshotId: string }> {
+    const turn = await this.scopedTurn(q, ownerId, targetTurnId);
+    // Another owner's turn is indistinguishable from an unknown id; a target in a
+    // different session of the same owner is likewise not addressable here.
+    if (turn.session_id !== sessionId) throw new ServiceError('TURN_NOT_FOUND', '本轮消息不存在。', 404);
+    const unavailable = (message: string) => new ServiceError('REWRITE_UNAVAILABLE', message, 409);
+    if (turn.operation !== 'chat') throw unavailable('仅支持重写最新一轮普通回复，开场不能重写。');
+    if (turn.archived_at) throw unavailable('这条回复已被新版本取代，仅支持最新一轮。');
+    // A Continue turn has no player question to answer again; the rewrite signal
+    // would have no authoritative ActorInput.userText. Keep the same code/message.
+    if (turn.chat_type === 'continue') throw unavailable('继续生成的回合没有可重写的玩家消息，仅支持最新一轮普通回复。');
+    if (!turn.snapshot_id) throw unavailable('该回合缺少生成前世界快照，历史轮不可重写。');
+    const snapshot = await this.row(q, 'SELECT * FROM world_snapshots WHERE id=$1 AND owner_id=$2 AND world_id=$3', [turn.snapshot_id, ownerId, world.id]);
+    if (!snapshot) throw unavailable('该回合缺少生成前世界快照，历史轮不可重写。');
+    const latest = await this.row(q, "SELECT id FROM turns WHERE owner_id=$1 AND world_id=$2 AND status='committed' AND archived_at IS NULL ORDER BY seq DESC LIMIT 1", [ownerId, world.id]);
+    if (latest?.id !== turn.id) throw unavailable('仅支持重写最新一轮，历史轮不可重写。');
+    // Snapshot baseline: anything queued or planned at snapshot time must still be
+    // in exactly that pre-target state. A job that started/completed since, or a
+    // director cursor aimed at another turn, means the world no longer matches.
+    const baseline = (snapshot.data as Record<string, any> | null)?.baseline as Record<string, any> | undefined;
+    for (const job of (Array.isArray(baseline?.settlements) ? baseline.settlements as Row[] : [])) {
+      const current = await this.row(q, 'SELECT status FROM world_settlements WHERE owner_id=$1 AND id=$2', [ownerId, job.id]);
+      if (!current || current.status !== 'pending') throw unavailable('更早的后台整理在快照后已开始或完成，不能安全重写。');
+    }
+    const baseDirection = baseline?.direction as Row | null | undefined;
+    const currentDirection = await this.row(q, 'SELECT requested_turn_id,status FROM world_directions WHERE owner_id=$1 AND world_id=$2', [ownerId, world.id]);
+    const baseRequested = baseDirection?.requestedTurnId ?? null;
+    const currentRequested = currentDirection?.requested_turn_id ?? null;
+    if (currentRequested !== null && String(currentRequested) !== targetTurnId && String(currentRequested) !== String(baseRequested))
+      throw unavailable('后台剧情规划已基于更新的回合，不能安全重写。');
+    if (currentDirection?.status === 'completed' && currentRequested !== null && String(currentRequested) !== targetTurnId
+      && (baseDirection?.status !== 'completed' || String(baseRequested) !== String(currentRequested)))
+      throw unavailable('后台剧情规划在快照后完成，不能安全重写。');
+    const otherPending = await this.row(q, "SELECT j.turn_id FROM world_settlements j WHERE j.owner_id=$1 AND j.world_id=$2 AND j.status<>'completed' AND j.turn_id<>$3 LIMIT 1", [ownerId, world.id, turn.id]);
+    if (otherPending) throw unavailable('更早回合的世界整理尚未完成，暂不能重写。');
+    const settlement = await this.row(q, 'SELECT status FROM world_settlements WHERE owner_id=$1 AND turn_id=$2', [ownerId, turn.id]);
+    const expected = turn.committed_revision === null || turn.committed_revision === undefined ? null
+      : Number(turn.committed_revision) + (settlement?.status === 'completed' ? 1 : 0);
+    if (expected === null || Number(world.revision) !== expected) throw unavailable('故事在此回合之后已有新的世界变化，仅支持最新一轮。');
+    const assistantRows = (await q.query("SELECT content FROM messages WHERE owner_id=$1 AND turn_id=$2 AND role='assistant' AND archived_at IS NULL ORDER BY seq", [ownerId, turn.id])).rows;
+    if (!assistantRows.length) throw unavailable('目标回合没有已保存的回复原文，不能重写。');
+    const previousResponse = assistantRows.map((row: Row) => String(row.content)).join('\n');
+    if (previousResponse.length > rewriteReferenceLimit) throw new ServiceError('REWRITE_REFERENCE_TOO_LARGE', '旧回复过长，无法作为重写参考；原版本保持不变。', 409);
+    const targetUserText = typeof turn.input_json?.userText === 'string' ? turn.input_json.userText : '';
+    return { turn, previousResponse, targetUserText, snapshotId: turn.snapshot_id };
+  }
+  /** Rebase a target turn's frozen pre-state input onto the new rewrite turn. The
+   * previous response never enters this object: it stays in rewrite_reference.
+   * Every revision field is moved to the current world revision together, and the
+   * on-demand dialogue boundary stays the target turn so the archived old reply can
+   * never be read back as current history. */
+  private rewriteInput(target: Row, turnId: string, userText: string, world: Row): ActorInput {
+    const input = structuredClone(target.input_json) as ActorInput;
+    const revision = Number(world.revision);
+    input.turnId = turnId;
+    input.userText = userText;
+    input.operation = 'chat';
+    delete input.preparedScenePlan;
+    input.world = { ...input.world, revision };
+    if (input.contextPack) {
+      input.contextPack.worldRevision = revision;
+      // Harness dialogue-tool binds this to the current Actor turn id; the archived
+      // boundary is enforced inside readDialogue from the frozen rewrite target.
+      input.contextPack.dialogue = { ...input.contextPack.dialogue, beforeTurnId: turnId };
+    }
+    for (const packet of Object.values(input.worldContext?.actorInputs ?? {})) {
+      packet.turnId = turnId;
+      packet.world = { ...packet.world, revision };
+      if (packet.contextPack) {
+        packet.contextPack.worldRevision = revision;
+        packet.contextPack.dialogue = { ...packet.contextPack.dialogue, beforeTurnId: turnId };
+      }
+    }
+    if (JSON.stringify(input).length > 23000) throw new ServiceError('INPUT_TOO_LARGE', '编辑后的消息超过上下文限制，请缩短消息。', 422);
+    return input;
+  }
+  /**
+   * Capture the complete pre-state world projection. Tables covered (all
+   * world-derived state plus scene/clock/plan cursors):
+   *   worlds.scene/story_time/story_elapsed_ms/real_anchor_at/clock_* + player_profile,
+   *   sessions.scene, world_entities, world_entity_knowledge, world_memory_snapshots,
+   *   world_story_events, events, world_directions (mainline/plan cursor).
+   * world_settlements is not projected: superseded jobs are fenced into
+   * world_settlement_archive instead, so a late worker write fails closed.
+   */
+  private async createWorldSnapshot(q: Query, ownerId: string, world: Row, sessionId: string, turnId: string): Promise<string> {
+    const worldId = world.id;
+    // Only the active projection is captured: archived versions from an earlier
+    // rewrite are already reverted and must never be resurrected into a snapshot.
+    const [sessions, entities, knowledge, memories, storyEvents, events, directions, unsettled] = await Promise.all([
+      q.query('SELECT id,scene FROM sessions WHERE owner_id=$1 AND world_id=$2 ORDER BY seq', [ownerId, worldId]),
+      q.query('SELECT * FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND archived_at IS NULL ORDER BY id', [ownerId, worldId]),
+      q.query(`SELECT k.* FROM world_entity_knowledge k JOIN world_entities e ON e.owner_id=k.owner_id AND e.world_id=k.world_id AND e.id=k.entity_id AND e.archived_at IS NULL
+        WHERE k.owner_id=$1 AND k.world_id=$2 ORDER BY k.character_id,k.entity_id`, [ownerId, worldId]),
+      q.query('SELECT * FROM world_memory_snapshots WHERE owner_id=$1 AND world_id=$2 ORDER BY character_id,through_seq', [ownerId, worldId]),
+      q.query('SELECT * FROM world_story_events WHERE owner_id=$1 AND world_id=$2 ORDER BY id', [ownerId, worldId]),
+      q.query('SELECT * FROM events WHERE owner_id=$1 AND world_id=$2 ORDER BY seq', [ownerId, worldId]),
+      q.query('SELECT * FROM world_directions WHERE owner_id=$1 AND world_id=$2', [ownerId, worldId]),
+      q.query("SELECT id,turn_id,status FROM world_settlements WHERE owner_id=$1 AND world_id=$2 AND status IN ('pending','running') ORDER BY seq", [ownerId, worldId]),
+    ]);
+    const id = randomUUID();
+    const direction = directions.rows[0] ?? null;
+    const data = {
+      version: 1,
+      world: {
+        scene: world.scene, story_time: world.story_time, story_elapsed_ms: world.story_elapsed_ms,
+        real_anchor_at: world.real_anchor_at, clock_world_ms: world.clock_world_ms, clock_active_ms: world.clock_active_ms,
+        clock_mode: world.clock_mode, clock_rate: world.clock_rate, player_profile: world.player_profile,
+      },
+      sessions: sessions.rows.map((row: Row) => ({ id: row.id, scene: row.scene })),
+      entities: entities.rows, entityKnowledge: knowledge.rows, memorySnapshots: memories.rows,
+      storyEvents: storyEvents.rows, events: events.rows, direction,
+      // Baseline safety: a rewrite is only safe while no background job that was
+      // already queued at snapshot time has since started or completed, and the
+      // director cursor did not commit a plan after this baseline.
+      baseline: {
+        revision: Number(world.revision),
+        latestTurnId: await this.latestCommittedTurnId(q, ownerId, worldId),
+        settlements: unsettled.rows.map((row: Row) => ({ id: row.id, turnId: row.turn_id, status: row.status })),
+        direction: direction ? { attempt: direction.attempt ?? null, status: direction.status, requestedTurnId: direction.requested_turn_id ?? null } : null,
+      },
+    };
+    await q.query('INSERT INTO world_snapshots(id,owner_id,world_id,session_id,turn_id,world_revision,data) VALUES($1,$2,$3,$4,$5,$6,$7)',
+      [id, ownerId, worldId, sessionId, turnId, world.revision, data]);
+    return id;
+  }
+  private async latestCommittedTurnId(q: Query, ownerId: string, worldId: string): Promise<string | null> {
+    return (await this.row(q, "SELECT id FROM turns WHERE owner_id=$1 AND world_id=$2 AND status='committed' AND archived_at IS NULL ORDER BY seq DESC LIMIT 1", [ownerId, worldId]))?.id ?? null;
+  }
+  /** Restore one snapshot inside the successful rewrite transaction. Rows are
+   * archived/rewritten rather than deleted where a foreign key or audit trail
+   * requires the old version to stay addressable. */
+  private async restoreWorldSnapshot(q: Query, ownerId: string, worldId: string, snapshotId: string): Promise<Row> {
+    const snapshot = await this.row(q, 'SELECT * FROM world_snapshots WHERE id=$1 AND owner_id=$2 AND world_id=$3', [snapshotId, ownerId, worldId]);
+    if (!snapshot) throw new ServiceError('REWRITE_UNAVAILABLE', '生成前世界快照已不可用，不能安全重写。', 409);
+    const data = snapshot.data as Record<string, any>;
+    if (!data || data.version !== 1 || !data.world) throw new ServiceError('REWRITE_UNAVAILABLE', '生成前世界快照格式无效，不能安全重写。', 409);
+    const w = data.world;
+    await q.query(`UPDATE worlds SET scene=$3,story_time=$4,story_elapsed_ms=$5,real_anchor_at=$6,clock_world_ms=$7,clock_active_ms=$8,clock_mode=$9,clock_rate=$10,player_profile=$11
+      WHERE owner_id=$1 AND id=$2`,
+      [ownerId, worldId, w.scene, w.story_time, w.story_elapsed_ms, w.real_anchor_at, w.clock_world_ms, w.clock_active_ms, w.clock_mode, w.clock_rate, w.player_profile]);
+    const sessions = Array.isArray(data.sessions) ? data.sessions as Row[] : [];
+    await q.query('UPDATE sessions SET scene=NULL WHERE owner_id=$1 AND world_id=$2', [ownerId, worldId]);
+    for (const session of sessions) await q.query('UPDATE sessions SET scene=$4 WHERE owner_id=$1 AND world_id=$2 AND id=$3', [ownerId, worldId, session.id, session.scene]);
+    // Entities created by the reverted turn are hidden (archived_at) instead of
+    // deleted: archived messages and knowledge rows still reference them.
+    await q.query('DELETE FROM world_entity_knowledge WHERE owner_id=$1 AND world_id=$2', [ownerId, worldId]);
+    await q.query('UPDATE world_entities SET archived_at=clock_timestamp() WHERE owner_id=$1 AND world_id=$2 AND archived_at IS NULL', [ownerId, worldId]);
+    for (const entity of (Array.isArray(data.entities) ? data.entities as Row[] : [])) await q.query(`INSERT INTO world_entities(owner_id,world_id,id,kind,name,description,state,known_by_character_ids,source_turn_id,created_at,updated_at,version)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+      ON CONFLICT(world_id,id) DO UPDATE SET kind=EXCLUDED.kind,name=EXCLUDED.name,description=EXCLUDED.description,state=EXCLUDED.state,
+        known_by_character_ids=EXCLUDED.known_by_character_ids,source_turn_id=EXCLUDED.source_turn_id,created_at=EXCLUDED.created_at,
+        updated_at=EXCLUDED.updated_at,version=EXCLUDED.version,archived_at=NULL`,
+      [ownerId, worldId, entity.id, entity.kind, entity.name, entity.description, entity.state, entity.known_by_character_ids, entity.source_turn_id, entity.created_at, entity.updated_at, entity.version]);
+    for (const row of (Array.isArray(data.entityKnowledge) ? data.entityKnowledge as Row[] : [])) await q.query(`INSERT INTO world_entity_knowledge(owner_id,world_id,character_id,entity_id,version,snapshot,observed_at,source_turn_id)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(world_id,character_id,entity_id) DO UPDATE SET version=EXCLUDED.version,snapshot=EXCLUDED.snapshot,observed_at=EXCLUDED.observed_at,source_turn_id=EXCLUDED.source_turn_id`,
+      [ownerId, worldId, row.character_id, row.entity_id, row.version, row.snapshot, row.observed_at, row.source_turn_id]);
+    await q.query('DELETE FROM world_memory_snapshots WHERE owner_id=$1 AND world_id=$2', [ownerId, worldId]);
+    for (const row of (Array.isArray(data.memorySnapshots) ? data.memorySnapshots as Row[] : [])) await q.query(`INSERT INTO world_memory_snapshots(owner_id,world_id,character_id,source_turn_id,through_seq,summary,provenance)
+      VALUES($1,$2,$3,$4,$5,$6,$7)`, [ownerId, worldId, row.character_id, row.source_turn_id, row.through_seq, row.summary, row.provenance]);
+    await q.query('DELETE FROM world_story_events WHERE owner_id=$1 AND world_id=$2', [ownerId, worldId]);
+    for (const row of (Array.isArray(data.storyEvents) ? data.storyEvents as Row[] : [])) await q.query(`INSERT INTO world_story_events(owner_id,world_id,id,version,record,source_turn_id,last_source_turn_id,updated_at)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, [ownerId, worldId, row.id, row.version, row.record, row.source_turn_id, row.last_source_turn_id, row.updated_at]);
+    await q.query('DELETE FROM events WHERE owner_id=$1 AND world_id=$2', [ownerId, worldId]);
+    for (const row of (Array.isArray(data.events) ? data.events as Row[] : [])) await q.query(`INSERT INTO events(id,owner_id,world_id,kind,text,visibility,character_id,source_turn_id,created_at,evidence,status)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+      [row.id, ownerId, worldId, row.kind, row.text, row.visibility, row.character_id, row.source_turn_id, row.created_at, row.evidence, row.status]);
+    // The plan cursor is restored from the snapshot; a frozen/unknown attempt is
+    // cleared so any in-flight director result is fenced by attempt mismatch.
+    await q.query('DELETE FROM world_directions WHERE owner_id=$1 AND world_id=$2', [ownerId, worldId]);
+    const direction = data.direction as Row | null;
+    if (direction) await q.query(`INSERT INTO world_directions(owner_id,world_id,requested_turn_id,claimed_turn_id,status,attempt,lease_expires_at,due_at,plan,guard,input_json,attempts,error_code,updated_at)
+      VALUES($1,$2,$3,$4,$5,NULL,NULL,$6,$7,$8,$9,$10,$11,$12)`,
+      [ownerId, worldId, direction.requested_turn_id, direction.claimed_turn_id ?? null,
+        ['pending','completed','failed'].includes(String(direction.status)) ? direction.status : 'pending',
+        direction.due_at, direction.plan, direction.guard, direction.input_json, direction.attempts ?? 0, direction.error_code, direction.updated_at]);
+    return this.scopedWorld(q, ownerId, worldId);
+  }
+  /** Move the superseded settlement jobs into the archive table so a late worker
+   * write cannot find its live row (fails closed) while the record is auditable. */
+  private async fenceSettlements(q: Query, ownerId: string, worldId: string, turnId: string, supersededBy: string): Promise<void> {
+    await q.query(`INSERT INTO world_settlement_archive(owner_id,world_id,turn_id,superseded_by_turn_id,record)
+      SELECT owner_id,world_id,turn_id,$4,to_jsonb(j) FROM world_settlements j WHERE owner_id=$1 AND world_id=$2 AND turn_id=$3
+      ON CONFLICT(owner_id,world_id,turn_id) DO UPDATE SET record=EXCLUDED.record,superseded_by_turn_id=EXCLUDED.superseded_by_turn_id,sealed_at=clock_timestamp()`,
+      [ownerId, worldId, turnId, supersededBy]);
+    await q.query('DELETE FROM world_settlements WHERE owner_id=$1 AND world_id=$2 AND turn_id=$3', [ownerId, worldId, turnId]);
   }
   async saveDraft(turn: StoredTurn, text: string, modelUsage?: ModelUsage): Promise<void> {
     const count = usage(modelUsage);
@@ -946,8 +1341,8 @@ export class StoryStore {
         || proof.source !== 'actor' || proof.characterId !== move.characterId
         || typeof proof.quote !== 'string' || !proof.quote.trim() || proof.quote.length > 1200) throw new ServiceError('ACTOR_LOCATION_INVALID', '移动证据必须来自本人当轮完整动作片段。', 422);
       const reply = replies.find(row => row.characterId === move.characterId);
-      const actor = await this.row(q, "SELECT name,state FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND id=$3 AND kind='npc'", [current.owner_id, current.world_id, move.characterId]);
-      const place = move.locationId === null ? undefined : await this.row(q, "SELECT name FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND id=$3 AND kind='location' AND $4=ANY(known_by_character_ids)", [current.owner_id, current.world_id, move.locationId, move.characterId]);
+      const actor = await this.row(q, "SELECT name,state FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND id=$3 AND kind='npc' AND archived_at IS NULL", [current.owner_id, current.world_id, move.characterId]);
+      const place = move.locationId === null ? undefined : await this.row(q, "SELECT name FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND id=$3 AND kind='location' AND archived_at IS NULL AND $4=ANY(known_by_character_ids)", [current.owner_id, current.world_id, move.locationId, move.characterId]);
       if ((move.locationId !== null && !place) || !reply || !actor || !validMovementEvidence(reply.text, proof.quote, place?.name ?? null, actor.name, authorNarrativeName(actor.state.narrativeName))) throw new ServiceError('ACTOR_LOCATION_INVALID', '只记录已发生的本人离开或到达；目的地必须已知，意图和台词不算到达。', 422);
       seen.add(move.characterId); destinations.set(move.characterId, { id: move.locationId, name: place?.name ?? null });
     }
@@ -964,21 +1359,56 @@ export class StoryStore {
     const presentCharacterIds = scene.presentCharacterIds.filter(id => !destinations.has(id) || destinations.get(id)!.name === scene.location);
     return { ...scene, presentCharacterIds };
   }
-  /** Production boundary: one visible response plus a durable background job. */
-  async commitDialogue(turn:StoredTurn,result:WorldTurnResult) {
+  /** Production boundary: one visible response plus a durable background job.
+   * The optional third argument is only a compatibility seam for the runtime task;
+   * the authoritative rewrite plan always comes from the frozen turn row. */
+  async commitDialogue(turn:StoredTurn,result:WorldTurnResult,options?: CommitOptions) {
     if(result.replies.length!==1 || result.replies[0].characterId!==turn.input.character.id || result.text!==result.replies[0].text)
       throw new ServiceError('REPLIES_INVALID','每轮只保存一条完整场景回复。',422);
-    return this.commit(turn,result.text,[],{actorFirst:true,settlement:result,replies:result.replies,
+    return this.commit(turn,result.text,[],{ ...(options ?? {}), actorFirst:true,settlement:result,replies:result.replies,
       scene:result.scene,usage:result.usage,observations:result.observations,storyTime:result.storyTime,
       entityChanges:[],activities:[],actorLocations:[]});
   }
   async commit(turn: StoredTurn, text: string, changes: WorldChange[], usageOrOptions?: ModelUsage | CommitOptions): Promise<{ message: Message; messages: Message[]; world: WorldView }> {
-    const options: CommitOptions = usageOrOptions && ['scene','usage','replies','entityChanges','activities','observations','actorLocations','storyTime','settledCharacterIds','settlement'].some(key => key in usageOrOptions) ? usageOrOptions as CommitOptions : { usage: { updater: usageOrOptions as ModelUsage | undefined } };
+    const options: CommitOptions = usageOrOptions && ['scene','usage','replies','entityChanges','activities','observations','actorLocations','storyTime','settledCharacterIds','settlement','restoreSnapshotId','supersedeTurnId'].some(key => key in usageOrOptions) ? usageOrOptions as CommitOptions : { usage: { updater: usageOrOptions as ModelUsage | undefined } };
     return this.transaction(async (q) => {
-      const world = await this.scopedWorld(q, turn.ownerId, turn.worldId, true);
+      let world = await this.scopedWorld(q, turn.ownerId, turn.worldId, true);
       const current = await this.row(q, "SELECT * FROM turns WHERE id=$1 AND owner_id=$2 AND attempt=$3 AND status='running' AND lease_expires_at>clock_timestamp() FOR UPDATE", [turn.id, turn.ownerId, turn.attempt]);
       if (!current) throw new ServiceError('TURN_LEASE_LOST', '本轮执行已结束或过期。');
       if (current.runtime_metadata.memoryPolicy !== MEMORY_POLICY) throw new ServiceError('RUNTIME_CHANGED', '记忆规则已更新，请作为新消息重新发送。');
+      // Real rewrite: only the newest committed ordinary turn is a valid target,
+      // and everything below happens in this single successful transaction. The
+      // generation stage never wrote the world, so a failed/cancelled attempt kept
+      // the old reply and old world untouched.
+      const frozenChatType: ChatType = isChatType(current.chat_type) ? current.chat_type : 'chat';
+      const supersedeTurnId: string | null = rewriteChatTypes.includes(frozenChatType) ? (current.target_turn_id ?? null) : null;
+      const isRewrite = supersedeTurnId !== null;
+      if (isRewrite) {
+        const reference = asRewriteReference(current.rewrite_reference);
+        const snapshotId = reference?.snapshotId;
+        if (!reference || !snapshotId || reference.turnId !== supersedeTurnId) throw new ServiceError('REWRITE_UNAVAILABLE', '重写目标缺少生成前世界快照，历史轮不可重写。', 409);
+        if ((options.restoreSnapshotId !== undefined && options.restoreSnapshotId !== snapshotId)
+          || (options.supersedeTurnId !== undefined && options.supersedeTurnId !== supersedeTurnId)) throw new ServiceError('REWRITE_INVALID', '重写参数与冻结目标不一致。', 422);
+        const latest = await this.row(q, "SELECT id FROM turns WHERE owner_id=$1 AND world_id=$2 AND status='committed' AND archived_at IS NULL ORDER BY seq DESC LIMIT 1", [turn.ownerId, turn.worldId]);
+        if (latest?.id !== supersedeTurnId) throw new ServiceError('REWRITE_UNAVAILABLE', '仅支持重写最新一轮，历史轮不可重写。', 409);
+        const otherPending = await this.row(q, "SELECT j.turn_id FROM world_settlements j WHERE j.owner_id=$1 AND j.world_id=$2 AND j.status<>'completed' AND j.turn_id<>$3 LIMIT 1", [turn.ownerId, turn.worldId, supersedeTurnId]);
+        if (otherPending) throw new ServiceError('REWRITE_UNAVAILABLE', '更早回合的世界整理尚未完成，暂不能重写。', 409);
+        // Fence before restoring: a late settlement or director result must fail
+        // closed instead of writing a superseded version back into the world.
+        await this.fenceSettlements(q, turn.ownerId, turn.worldId, supersedeTurnId, current.id);
+        // Archive the superseded version completely (old player line + reply +
+        // internal marker); the replacement turn keeps one visible authoritative
+        // player message so the question is never duplicated and never lost.
+        await q.query('UPDATE messages SET archived_at=clock_timestamp() WHERE owner_id=$1 AND turn_id=$2 AND archived_at IS NULL', [turn.ownerId, supersedeTurnId]);
+        if (frozenChatType === 'regenerate') {
+          // The accepted event still reports the fixed operation marker; once the
+          // new version is the official fact the same row becomes the player line.
+          const question = asRewriteReference(current.rewrite_reference)?.targetUserText ?? '';
+          if (question.trim()) await q.query("UPDATE messages SET kind='dialogue',content=$3 WHERE owner_id=$1 AND turn_id=$2 AND role='user' AND kind='operation' AND archived_at IS NULL", [turn.ownerId, current.id, question]);
+        }
+        await q.query('UPDATE turns SET archived_at=clock_timestamp(),superseded_by=$3 WHERE owner_id=$1 AND id=$2 AND archived_at IS NULL', [turn.ownerId, supersedeTurnId, current.id]);
+        world = await this.restoreWorldSnapshot(q, turn.ownerId, turn.worldId, snapshotId);
+      }
       const input = current.input_json as ActorInput;
       const temporal = input.worldContext?.temporal;
       let appliedTime: ReturnType<typeof resolveStoryTime> | undefined;
@@ -1010,7 +1440,7 @@ export class StoryStore {
       const scene = await this.validateScene(q, proposedScene, turn.ownerId, turn.worldId);
       const messages: Message[] = [];
       for (const reply of replies) {
-        const entity = await this.row(q, "SELECT * FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND id=$3 AND kind='npc'", [turn.ownerId, turn.worldId, reply.characterId]);
+        const entity = await this.row(q, "SELECT * FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND id=$3 AND kind='npc' AND archived_at IS NULL", [turn.ownerId, turn.worldId, reply.characterId]);
         if (!entity || !audience.includes(reply.characterId) || !scene.presentCharacterIds.includes(reply.characterId) || typeof reply.text !== 'string' || !reply.text.trim() || reply.text.length > 12000) throw new ServiceError('REPLIES_INVALID', '回应角色不在授权场景中或正文无效。', 422);
         if (reply.callId) {
           const call = await this.row(q, "SELECT record FROM agent_calls WHERE owner_id=$1 AND turn_id=$2 AND attempt=$3 AND (id=$4 OR (record->>'status'='reused' AND record->>'sourceCallId'=$4)) AND record->>'agent'='actor' AND record->>'status' IN ('completed','reused')", [turn.ownerId, turn.id, turn.attempt, reply.callId]);
@@ -1035,7 +1465,7 @@ export class StoryStore {
           || (activity.minimumDurationMs !== undefined && (!Number.isFinite(activity.minimumDurationMs) || activity.minimumDurationMs < 1000 || activity.kind === 'completed' && activity.minimumDurationMs > (storyWindow ?? clock.activeElapsedRealMs ?? 0)))
           || !['completed','invitation'].includes(activity.kind) || (activity.requiresIntervention && activity.kind !== 'invitation')
           || activities.some(row => row.characterId === activity.characterId)) throw new ServiceError('ACTIVITY_INVALID', '离线活动超出角色真实时间或需要玩家介入。', 422);
-        if (activity.locationId && !await this.row(q, "SELECT id FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND id=$3 AND kind='location'", [turn.ownerId, turn.worldId, activity.locationId])) throw new ServiceError('ACTIVITY_INVALID', '离线活动地点不属于这个世界。', 422);
+        if (activity.locationId && !await this.row(q, "SELECT id FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND id=$3 AND kind='location' AND archived_at IS NULL", [turn.ownerId, turn.worldId, activity.locationId])) throw new ServiceError('ACTIVITY_INVALID', '离线活动地点不属于这个世界。', 422);
         if (activity.kind === 'completed') {
           const known = actor!.worldContext!.entities;
           const frozenLocation = known.find(entity => entity.kind === 'npc' && entity.id === activity.characterId)?.state.locationId;
@@ -1043,7 +1473,13 @@ export class StoryStore {
         }
         activities.push({ ...activity, occurredAt: clock.asOf, sourceTurnId: current.id, ...(appliedTime ? { storyTime: appliedTime.story } : {}) });
       }
-      const changed = await q.query('UPDATE worlds SET revision=revision+1 WHERE id=$1 AND owner_id=$2 AND revision=$3', [turn.worldId, turn.ownerId, current.base_revision]);
+      // A rewrite restored the pre-state above, so it may not use the frozen base
+      // revision for the CAS: the superseded turn's own settlement could have
+      // completed between begin and commit. The world row is locked either way and
+      // the revision only ever advances (monotonic).
+      const changed = isRewrite
+        ? await q.query('UPDATE worlds SET revision=revision+1 WHERE id=$1 AND owner_id=$2', [turn.worldId, turn.ownerId])
+        : await q.query('UPDATE worlds SET revision=revision+1 WHERE id=$1 AND owner_id=$2 AND revision=$3', [turn.worldId, turn.ownerId, current.base_revision]);
       if (changed.rowCount !== 1) throw new ServiceError('WORLD_CHANGED', '故事已有新的进展，请作为新消息重新发送。');
       await this.locateSceneActors(q, turn.ownerId, turn.worldId, scene, current.character_id);
       const currentScene = await this.applyActorLocations(q, current, scene, replies, options.actorLocations ?? []);
@@ -1056,7 +1492,7 @@ export class StoryStore {
       await q.query('UPDATE sessions SET scene=CASE WHEN scene IS NOT NULL THEN $3 ELSE scene END WHERE id=$1 AND owner_id=$2', [turn.sessionId, turn.ownerId, currentScene]);
       if (appliedTime && temporal) {
         await q.query('UPDATE worlds SET story_time=$3,real_anchor_at=$4,clock_world_ms=clock_world_ms+$5,story_elapsed_ms=story_elapsed_ms+$5 WHERE id=$1 AND owner_id=$2',[turn.worldId,turn.ownerId,appliedTime.story,temporal.real.now,appliedTime.elapsedMs]);
-        for (const characterId of scene.playerPresent === false ? [] : audience) await q.query("UPDATE world_entities SET state=state || $4::jsonb WHERE owner_id=$1 AND world_id=$2 AND id=$3 AND kind='npc'",[turn.ownerId,turn.worldId,characterId,{lastEncounterAt:temporal.real.now,lastEncounterStoryTime:appliedTime.story}]);
+        for (const characterId of scene.playerPresent === false || isRewrite ? [] : audience) await q.query("UPDATE world_entities SET state=state || $4::jsonb WHERE owner_id=$1 AND world_id=$2 AND id=$3 AND kind='npc'",[turn.ownerId,turn.worldId,characterId,{lastEncounterAt:temporal.real.now,lastEncounterStoryTime:appliedTime.story}]);
         const settled = options.settledCharacterIds ?? activities.map(activity => activity.characterId);
         if (!Array.isArray(settled) || settled.length > 3 || new Set(settled).size !== settled.length || settled.some(id => typeof id !== 'string' || !input.worldContext?.actorInputs[id]?.worldContext?.temporal || settlementWindow(input.worldContext.actorInputs[id].worldContext!.temporal!,appliedTime!) < 1000)) throw new ServiceError('ACTIVITY_INVALID','时间审阅游标只能推进本轮确有可结算跨度的角色。',422);
         if (activities.some(activity=>!settled.includes(activity.characterId))) throw new ServiceError('ACTIVITY_INVALID','活动必须属于本轮已审阅角色。',422);
@@ -1073,7 +1509,7 @@ export class StoryStore {
       const counts: TurnUsage = {};
       for (const key of agentKeys) { const count = usage(options.usage?.[key]); if (count) counts[key] = count; }
       const episodeScene = initialScene.mode === 'direct' ? { ...scene, presentCharacterIds: [current.character_id] } : scene;
-      const completed = await q.query("UPDATE turns SET status='committed',actor_draft=NULL,usage=usage || $4::jsonb,error_code=NULL,error_message=NULL,episode_scene=$5,episode_participant_ids=$6,activities=$7,episode_observations=$8,story_time=$9,episode_entity_ids=$10,updated_at=clock_timestamp() WHERE id=$1 AND owner_id=$2 AND attempt=$3 AND status='running' AND lease_expires_at>clock_timestamp()", [turn.id, turn.ownerId, turn.attempt, JSON.stringify(counts), episodeScene, audience, JSON.stringify(activities), observations ? JSON.stringify(observations) : null,appliedTime?.story ?? null,(options.entityChanges ?? []).map(change => change.entity.id)]);
+      const completed = await q.query("UPDATE turns SET status='committed',actor_draft=NULL,usage=usage || $4::jsonb,error_code=NULL,error_message=NULL,episode_scene=$5,episode_participant_ids=$6,activities=$7,episode_observations=$8,story_time=$9,episode_entity_ids=$10,committed_revision=$11,updated_at=clock_timestamp() WHERE id=$1 AND owner_id=$2 AND attempt=$3 AND status='running' AND lease_expires_at>clock_timestamp()", [turn.id, turn.ownerId, turn.attempt, JSON.stringify(counts), episodeScene, audience, JSON.stringify(activities), observations ? JSON.stringify(observations) : null,appliedTime?.story ?? null,(options.entityChanges ?? []).map(change => change.entity.id), Number(world.revision) + 1]);
       if (completed.rowCount !== 1) throw new ServiceError('TURN_LEASE_LOST', '本轮执行已结束或过期。');
       if (options.settlement) {
         if (!input.worldContext || JSON.stringify(options.settlement).length > 300000 || !isDeepStrictEqual(options.settlement.replies,replies)) throw new ServiceError('SETTLEMENT_INVALID','后台整理必须对应已保存的完整回复。',422);
@@ -1316,7 +1752,7 @@ export class StoryStore {
         || !['completed','invitation'].includes(activity.kind) || (activity.requiresIntervention && activity.kind!=='invitation')
         || (activity.minimumDurationMs!==undefined && (!Number.isFinite(activity.minimumDurationMs) || activity.minimumDurationMs<1000 || activity.kind==='completed' && activity.minimumDurationMs>storyWindow))
         || activities.some(row=>row.characterId===activity.characterId) || !result.settledCharacterIds.includes(activity.characterId)) throw new ServiceError('ACTIVITY_INVALID','后台活动超出本轮冻结的可结算时间。',422);
-      if(activity.locationId && !await this.row(q,"SELECT id FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND id=$3 AND kind='location'",[job.ownerId,job.worldId,activity.locationId])) throw new ServiceError('ACTIVITY_INVALID','后台活动地点不存在。',422);
+      if(activity.locationId && !await this.row(q,"SELECT id FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND id=$3 AND kind='location' AND archived_at IS NULL",[job.ownerId,job.worldId,activity.locationId])) throw new ServiceError('ACTIVITY_INVALID','后台活动地点不存在。',422);
       if(activity.kind==='completed') {
         const known=actor!.worldContext!.entities;
         const location=known.find(entity=>entity.kind==='npc' && entity.id===activity.characterId)?.state.locationId;
@@ -1534,9 +1970,11 @@ export class StoryStore {
   }
   private async turnView(q: Query, ownerId: string, id: string): Promise<TurnView> {
     const turn = await this.scopedTurn(q, ownerId, id);
-    const messages = (await q.query('SELECT m.*,$3::text AS turn_status FROM messages m WHERE m.turn_id=$1 AND m.owner_id=$2 ORDER BY m.seq', [id, ownerId, turn.status])).rows.map((row) => this.messageView(row));
+    // A direct turn lookup is an audit read: archived versions keep their messages,
+    // while session detail and pagination never expose them.
+    const messages = (await q.query('SELECT m.*,t.operation,t.chat_type,$3::text AS turn_status FROM messages m LEFT JOIN turns t ON t.id=m.turn_id AND t.owner_id=m.owner_id WHERE m.turn_id=$1 AND m.owner_id=$2 ORDER BY m.seq', [id, ownerId, turn.status])).rows.map((row) => this.messageView(row));
     const assistant = messages.find((message) => message.role === 'assistant');
-    return { id, worldId: turn.world_id, sessionId: turn.session_id, status: turn.status, phase: turn.phase, userMessage: messages.find((message) => message.role === 'user')!, ...(assistant ? { assistantMessage: assistant, assistantMessages: messages.filter(message => message.role === 'assistant') } : {}), ...(turn.error_code ? { error: { code: turn.error_code, message: turn.error_message } } : {}) };
+    return { id, worldId: turn.world_id, sessionId: turn.session_id, status: turn.status, phase: turn.phase, userMessage: messages.find((message) => message.role === 'user')!, operation: turnOperation(turn), ...(assistant ? { assistantMessage: assistant, assistantMessages: messages.filter(message => message.role === 'assistant') } : {}), ...(turn.error_code ? { error: { code: turn.error_code, message: turn.error_message } } : {}) };
   }
   async getTurn(ownerId: string, id: string): Promise<TurnView> {
     return this.transaction(async (q) => {

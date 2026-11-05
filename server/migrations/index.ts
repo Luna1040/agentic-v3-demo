@@ -167,6 +167,15 @@ export async function migrate(pool: Pool, options: { appRole?: string } = {}): P
       await client.query(auditSql);
       await client.query('INSERT INTO schema_migrations(version,checksum) VALUES(17,$1)',[auditChecksum]);
     }
+    const chatOperationSql=await readFile(new URL('./018_chat_operations.sql',import.meta.url),'utf8');
+    const chatOperationChecksum=createHash('sha256').update(chatOperationSql).digest('hex');
+    const chatOperationMigration=await client.query('SELECT checksum FROM schema_migrations WHERE version=18');
+    if(chatOperationMigration.rows[0]){
+      if(chatOperationMigration.rows[0].checksum!==chatOperationChecksum)throw new Error('Migration 018 checksum mismatch.');
+    }else{
+      await client.query(chatOperationSql);
+      await client.query('INSERT INTO schema_migrations(version,checksum) VALUES(18,$1)',[chatOperationChecksum]);
+    }
     if (options.appRole) {
       const quote = (identifier: string) => `"${identifier.replaceAll('"', '""')}"`;
       const schema = quote((await client.query('SELECT current_schema() AS name')).rows[0].name);
@@ -189,6 +198,10 @@ export async function migrate(pool: Pool, options: { appRole?: string } = {}): P
       await client.query(`GRANT SELECT ON legacy_agent_catalog TO ${role}`);
       await client.query(`REVOKE ALL ON world_runtime_audit FROM ${role}`);
       await client.query(`GRANT SELECT,INSERT ON world_runtime_audit TO ${role}`);
+      await client.query(`REVOKE ALL ON world_snapshots FROM ${role}`);
+      await client.query(`GRANT SELECT,INSERT,UPDATE,DELETE ON world_snapshots TO ${role}`);
+      await client.query(`REVOKE ALL ON world_settlement_archive FROM ${role}`);
+      await client.query(`GRANT SELECT,INSERT,UPDATE,DELETE ON world_settlement_archive TO ${role}`);
       await client.query(`REVOKE ALL ON ALL SEQUENCES IN SCHEMA ${schema} FROM ${role}`);
       await client.query(`GRANT USAGE,SELECT ON ALL SEQUENCES IN SCHEMA ${schema} TO ${role}`);
     }

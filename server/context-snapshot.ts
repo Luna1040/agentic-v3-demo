@@ -15,14 +15,18 @@ export interface ContextSnapshot {
   eventLedgerOverflow?: LedgerOverflow;
 }
 export async function loadContextSnapshot(q: Pick<Pool | PoolClient, 'query'>, ownerId: string, worldId: string): Promise<ContextSnapshot> {
-  const entities=(await q.query('SELECT * FROM world_entities WHERE owner_id=$1 AND world_id=$2 ORDER BY created_at,id',[ownerId,worldId])).rows;
-  const knowledgeRows=(await q.query('SELECT character_id,snapshot,observed_at,source_turn_id FROM world_entity_knowledge WHERE owner_id=$1 AND world_id=$2 ORDER BY entity_id',[ownerId,worldId])).rows;
+  // Rewritten-away world versions are archived, never deleted: the projection must
+  // not resurrect them into the next turn's frozen context.
+  const entities=(await q.query('SELECT * FROM world_entities WHERE owner_id=$1 AND world_id=$2 AND archived_at IS NULL ORDER BY created_at,id',[ownerId,worldId])).rows;
+  const knowledgeRows=(await q.query(`SELECT k.character_id,k.snapshot,k.observed_at,k.source_turn_id FROM world_entity_knowledge k
+    JOIN world_entities e ON e.owner_id=k.owner_id AND e.world_id=k.world_id AND e.id=k.entity_id AND e.archived_at IS NULL
+    WHERE k.owner_id=$1 AND k.world_id=$2 ORDER BY k.entity_id`,[ownerId,worldId])).rows;
   const pendingRows=(await q.query(`SELECT t.id,t.seq,t.character_id,t.episode_participant_ids,t.activities,j.status,j.result->'deferredCommands' AS candidate_commands FROM turns t JOIN world_settlements j ON j.turn_id=t.id
     WHERE t.owner_id=$1 AND t.world_id=$2 AND t.status='committed' AND (j.status<>'completed' OR EXISTS(
       SELECT 1 FROM jsonb_array_elements(COALESCE(j.result->'deferredCommands','[]'::jsonb)) c(command) WHERE ${unresolvedCandidatePredicate}
     )) ORDER BY t.seq`,[ownerId,worldId])).rows;
   const pending=pendingRows.map(row=>{const {candidate_commands,...scope}=row;return {...scope,unresolvedCharacterIds:candidateRecoveryCharacters(row as any)};});
-  const previous=(await q.query("SELECT updated_at,episode_scene,episode_participant_ids FROM turns WHERE owner_id=$1 AND world_id=$2 AND status='committed' ORDER BY seq DESC LIMIT 1",[ownerId,worldId])).rows[0];
+  const previous=(await q.query("SELECT updated_at,episode_scene,episode_participant_ids FROM turns WHERE owner_id=$1 AND world_id=$2 AND status='committed' AND archived_at IS NULL ORDER BY seq DESC LIMIT 1",[ownerId,worldId])).rows[0];
   const ids=entities.flatMap(row=>typeof row.state?.arcProvenance?.turnId==='string' ? [row.state.arcProvenance.turnId] : []).filter(id=>/^[a-f0-9-]{36}$/i.test(id));
   const sequences=ids.length?(await q.query('SELECT id,seq FROM turns WHERE owner_id=$1 AND world_id=$2 AND id=ANY($3::uuid[])',[ownerId,worldId,ids])).rows:[];
   const knowledge=new Map<string,Row[]>();

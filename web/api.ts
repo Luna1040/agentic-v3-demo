@@ -1,4 +1,5 @@
 import type { PlayerProfile, AgentKey, AgentPromptConfig, AgentTestResult, Bootstrap, Message, RuntimeAuditView, SceneState, SessionDetail, TurnEvent, TurnTrace, TurnView, WorldView } from '../shared/contracts';
+import { turnRequestBody, type TurnRequestInput } from './chat-operations.ts';
 
 export class ApiError extends Error {
   constructor(message: string, public code = 'REQUEST_FAILED', public status = 0) { super(message); this.name = 'ApiError'; }
@@ -35,7 +36,7 @@ export interface ApiClient {
   agentCatalog(options?: RequestOptions): Promise<{ agents: LegacyAgentCatalogEntry[] }>;
   savePrompt(key: AgentKey, input: { content: string; expectedVersion: number }, options?: RequestOptions): Promise<AgentPromptConfig>;
   testAgent(key: AgentKey, input: { sessionId: string; userText: string; prompt: string; assistantText?: string }, options?: RequestOptions): Promise<AgentTestResult>;
-  stream(id: string, input: { clientTurnId: string; content: string }, onEvent: (event: TurnEvent) => void, options?: RequestOptions): Promise<void>;
+  stream(id: string, input: TurnRequestInput, onEvent: (event: TurnEvent) => void, options?: RequestOptions): Promise<void>;
   opening(id: string, input: { clientTurnId: string }, onEvent: (event: TurnEvent) => void, options?: RequestOptions): Promise<void>;
 }
 export interface ApiClientOptions {
@@ -106,7 +107,7 @@ export function createApiClient({ baseUrl = '/api', fetch: fetchImpl = globalThi
     agentCatalog: options => json('/dev/agent-catalog', options),
     savePrompt: (key, input, options) => json('/dev/prompts/' + encodeURIComponent(key), options, 'PUT', input),
     testAgent: (key, input, options) => json('/dev/agents/' + encodeURIComponent(key) + '/test', options, 'POST', input),
-    stream: (id, input, onEvent, options) => stream(`/sessions/${encodeURIComponent(id)}/turns`, input, onEvent, options),
+    stream: (id, input, onEvent, options) => stream(`/sessions/${encodeURIComponent(id)}/turns`, turnRequestBody(input), onEvent, options),
     opening: (id, input, onEvent, options) => stream(`/sessions/${encodeURIComponent(id)}/opening`, input, onEvent, options),
   };
 }

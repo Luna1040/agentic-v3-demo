@@ -26,12 +26,24 @@ export interface Session {
   createdAt: string; updatedAt: string;
   scene?: SceneState; dynamicOpening?: boolean;
 }
+export type ChatType = 'chat' | 'continue' | 'regenerate' | 'edit_regenerate';
+/** The request signal frozen on a turn. `opening` is a generation kind, not a chat
+ * operation; operation turns keep `operation='chat'` in the database and report
+ * their chatType here so the client can distinguish them after a refresh. */
+export type TurnOperation = 'chat' | 'opening' | ChatType;
 export interface Message {
   playerName?: string;
   id: string; turnId: string | null; sessionId: string;
   role: 'user' | 'assistant'; content: string; createdAt: string;
   status?: 'committed' | 'pending' | 'failed' | 'cancelled';
   characterId?: string; characterName?: string; kind?: 'dialogue' | 'operation';
+  /** Frozen operation of the turn this message belongs to (server-authoritative). */
+  operation?: TurnOperation;
+  /** Present on messages of this session's newest committed ordinary turn when the
+   * turn itself is eligible for a rewrite. World-state safety (revision, pending
+   * background work) is reported separately by SessionDetail.rewriteTarget.available,
+   * so a server-authoritative check must also pass before submitting. */
+  rewritable?: boolean;
 }
 export interface MemoryEvidence { source: 'user'; turnId: string }
 export type MemoryStatus = 'active' | 'unverified' | 'retracted';
@@ -80,12 +92,20 @@ export interface RuntimeAuditView {
 export interface Bootstrap {
   characters: Character[]; sessions: Session[]; worlds: WorldView[]; status: RuntimeStatus;
 }
-export interface SessionDetail { session: Session; messages: Message[]; world: WorldView; hasMore: boolean; nextBefore: string | null }
+export interface SessionDetail {
+  session: Session; messages: Message[]; world: WorldView; hasMore: boolean; nextBefore: string | null;
+  /** Server-authoritative rewrite availability for this session's newest committed
+   * ordinary turn (the client never infers it from cached messages). */
+  rewriteTarget?: { turnId: string; available: boolean };
+}
 export type TurnStatus = 'running' | 'committed' | 'failed' | 'cancelled';
 export interface TurnView {
   id: string; worldId: string; sessionId: string; status: TurnStatus;
   phase: 'planning' | 'responding' | 'settling'; userMessage: Message;
   assistantMessage?: Message; assistantMessages?: Message[]; error?: { code: string; message: string };
+  /** Always emitted by the store. Optional in the type only so older fixtures that
+   * predate the chat-operation signal still type-check (they mean plain chat). */
+  operation?: TurnOperation;
 }
 export type TurnEvent =
   | { type: 'accepted'; turnId: string; userMessage: Message; replayed?: boolean }

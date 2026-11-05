@@ -1,4 +1,5 @@
-import type { RuntimeStatus } from '../shared/contracts.ts';
+import type { AgentKey, RuntimeStatus } from '../shared/contracts.ts';
+import type { OperationContext } from './chat-operations.ts';
 import type * as Harness from '../shared/harness.ts';
 export type { ActorInput, ContextPack, DialogueReadRequest, DialogueReadResult, ActorResult, DialogueReadRecord } from '../shared/harness.ts';
 export type ModelUsage = Harness.RuntimeUsage;
@@ -12,6 +13,19 @@ export type PromptSet = Pick<Harness.RuntimePrompts, 'main'|'actor'|'updater'> &
 export type TurnResult = Omit<Harness.TurnResult,'discardedChanges'|'changes'> & Partial<Pick<Harness.TurnResult,'discardedChanges'>> & {changes:WorldChange[]};
 export type WorldTurnResult = Omit<Harness.WorldTurnResult,'discardedChanges'> & Partial<Pick<Harness.WorldTurnResult,'discardedChanges'>>;
 export type RunTurnOptions = Harness.TurnCallOptions & Required<Pick<Harness.TurnCallOptions,'signal'|'onTextDelta'>>;
+/** One isolated runtime rebuilt from the same Harness build for a single turn.
+ * The shared runtime objects (and their prompts) are never mutated. */
+export interface RuntimeForkOptions {
+  prompts: PromptSet;
+  /** Extra stable identity merged into the runtime metadata and fingerprint. */
+  identity?: Record<string, unknown>;
+  promptVersions?: Partial<Record<AgentKey, number>>;
+}
+export type RuntimeFork = (options: RuntimeForkOptions) => Promise<StoryRuntime>;
+/** Builds the isolated runtime for one chat-operation turn. The production default
+ * lives in `turn-service.ts` and forks the shared runtime (same build identity and
+ * provider config, operation prompts only); tests may inject a recording resolver. */
+export type OperationRuntimeResolver = (context: OperationContext) => Promise<StoryRuntime>;
 export interface StoryRuntime {
   actor(input:Harness.ActorInput,options:Harness.ActorCallOptions & Required<Pick<Harness.ActorCallOptions,'signal'|'onTextDelta'>>):Promise<Harness.ActorResult>;
   streamDialogue?(input: Harness.ActorInput, options: RunTurnOptions): Promise<WorldTurnResult>;
@@ -24,6 +38,9 @@ export interface StoryRuntime {
   updateWorld(input:Harness.UpdaterInput,options:{signal:AbortSignal}):Promise<{changes:WorldChange[];scene?:Harness.SceneState;usage?:ModelUsage}>;
   testAgent?(key:Harness.AgentKey,input:Harness.ActorInput & {assistantText?:string},options:Harness.TestAgentOptions & {signal:AbortSignal}):ReturnType<Harness.StoryRuntime['testAgent']>;
   readonly prompts?:Readonly<PromptSet>;
+  /** Rebuilds a per-turn runtime with different prompts/identity while reusing
+   * the same Harness build identity checks and provider configuration. */
+  fork?:RuntimeFork;
   status:RuntimeStatus;
   readonly metadata?:Record<string,unknown>;
 }

@@ -1,16 +1,50 @@
-import type { TurnEvent, TurnView } from '../shared/contracts.ts';
-import { ServiceError, validateChanges, type ActorCheckpoint, type StoryRuntime, type WorldTurnResult } from './runtime.ts';
-import { StoryStore, type StoredTurn } from './store.ts';
+import type { AgentKey, TurnEvent, TurnView } from '../shared/contracts.ts';
+import { ServiceError, validateChanges, type ActorCheckpoint, type OperationRuntimeResolver, type StoryRuntime, type WorldTurnResult } from './runtime.ts';
+import { StoryStore, type CommitOptions, type StoredTurn } from './store.ts';
 import { observationText } from './observations.ts';
 import { SettlementWorker } from './settlement-worker.ts';
 import { DirectorWorker } from './director.ts';
 import { dialogueExecution } from './execution-mode.ts';
+import { attachOperationReference, buildOperationPrompts, normalizeOperationContext, operationPromptBudget, operationRuntimeIdentity, type OperationContext, type OperationTurnFields } from './chat-operations.ts';
+
+const agentKeys: AgentKey[] = ['main', 'actor', 'updater', 'opening', 'pulse', 'arbiter'];
+
+function promptVersionsOf(metadata: Record<string, unknown> | undefined): Partial<Record<AgentKey, number>> | undefined {
+  const value = metadata?.promptVersions;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const versions: Partial<Record<AgentKey, number>> = {};
+  for (const key of agentKeys) {
+    const version = (value as Record<string, unknown>)[key];
+    if (Number.isSafeInteger(version) && (version as number) >= 0) versions[key] = version as number;
+  }
+  return Object.keys(versions).length ? versions : undefined;
+}
+
+/** Production factory: one isolated runtime per operation turn, built from the same
+ * Harness build identity and provider config (via `fork`). The shared runtime and
+ * its prompts are never mutated, and plain chat never calls this. The operation
+ * prompt budget is recorded in the runtime identity so audits can prove which
+ * reference text reached the model request. */
+export function createOperationRuntimeResolver(base: StoryRuntime): OperationRuntimeResolver {
+  return async (context) => {
+    if (!base.prompts || !base.fork) throw new ServiceError('RUNTIME_UNAVAILABLE', '当前运行时无法为操作回合隔离 Prompt。', 503);
+    const prompts = buildOperationPrompts(base.prompts, context);
+    const budget = operationPromptBudget(base.prompts, context);
+    const versions = promptVersionsOf(base.metadata);
+    return base.fork({ prompts, ...(versions ? { promptVersions: versions } : {}),
+      identity: { ...operationRuntimeIdentity(context), chatOperationPrompt: {
+        version: budget.version, limit: budget.limit, baseLength: budget.baseLength, policyLength: budget.policyLength,
+        referenceLength: budget.referenceLength, questionLength: budget.questionLength, finalLength: budget.finalLength } } });
+  };
+}
 
 export class TurnService {
   private active = new Map<string, { turn: StoredTurn; controller: AbortController; done: Promise<void> }>();
   readonly settlement: SettlementWorker;
   readonly director: DirectorWorker;
-  constructor(readonly store: StoryStore, readonly runtime: StoryRuntime, resolveRuntime: () => Promise<StoryRuntime> = async () => runtime) {
+  constructor(readonly store: StoryStore, readonly runtime: StoryRuntime,
+    resolveRuntime: () => Promise<StoryRuntime> = async () => runtime,
+    private readonly operationRuntime?: OperationRuntimeResolver) {
     this.settlement = new SettlementWorker(store, resolveRuntime);
     this.director = new DirectorWorker(store, resolveRuntime);
     if (runtime.settleWorldTurn) this.settlement.start();
@@ -25,6 +59,26 @@ export class TurnService {
     return done;
   }
 
+  /** The operation turn's server-authoritative reference. The previous response is
+   * re-read from the store for the frozen target, so a Regenerate chain (A→B→C)
+   * always carries the current committed reply (B), never a cached first version.
+   * The join rule matches the store's frozen reference (one reply per assistant
+   * message, joined with a newline). */
+  private async authoritativeOperationContext(turn: StoredTurn, context: OperationContext): Promise<OperationContext> {
+    if (context.chatType === 'chat' || context.chatType === 'continue') return context;
+    const userText = turn.input?.userText;
+    if (typeof userText === 'string' && userText.trim()) context.authoritativeUserMessage = userText;
+    const targetTurnId = (turn as StoredTurn & OperationTurnFields).targetTurnId ?? context.previousResponse?.turnId;
+    if (!targetTurnId) return context;
+    try {
+      const view = await this.store.getTurn(turn.ownerId, targetTurnId);
+      const messages = view.assistantMessages?.length ? view.assistantMessages : (view.assistantMessage ? [view.assistantMessage] : []);
+      const text = messages.map(message => message.content).join('\n');
+      if (text.trim()) context.previousResponse = { turnId: targetTurnId, text };
+    } catch { /* The store rejects an unavailable target before execution; keep the frozen reference. */ }
+    return context;
+  }
+
   private async execute(turn: StoredTurn, controller: AbortController, emit: (event: TurnEvent) => void, runtime: StoryRuntime): Promise<void> {
     let phase: 'planning' | 'responding' | 'settling' = 'responding';
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -36,14 +90,23 @@ export class TurnService {
       } catch { controller.abort(new ServiceError('TURN_LEASE_LOST', '本轮执行已结束或过期。')); }
     };
     try {
-      const execution = dialogueExecution(runtime, turn.input);
+      const operation = normalizeOperationContext(turn as StoredTurn & OperationTurnFields);
+      const context = await this.authoritativeOperationContext(turn, operation);
+      // Plain chat keeps the shared runtime object untouched; a chat operation gets
+      // its own isolated runtime for this attempt only (never cached, never shared).
+      const activeRuntime = context.chatType === 'chat' ? runtime
+        : await (this.operationRuntime ?? createOperationRuntimeResolver(runtime))(context);
+      // The complete reference travels in the isolated Actor prompt; this seam is the
+      // single switch point should a legal ActorInput channel be confirmed later.
+      const actorInput = attachOperationReference(turn.input, context);
+      const execution = dialogueExecution(activeRuntime, actorInput);
       phase = execution.phase;
       await renew();
       controller.signal.throwIfAborted();
       const {living,deferred,run,actorFirst} = execution;
       if (run) {
         emit({ type: 'phase', turnId: turn.id, phase });
-        const result = await this.abortable(run(turn.input, {
+        const result = await this.abortable(run(actorInput, {
           attemptId: turn.attempt, signal: controller.signal,
           ...(deferred ? { deferWorldUpdate: true, actorFirst } : {}),
           ...(turn.checkpoint ? { resume: turn.checkpoint as unknown as ActorCheckpoint } : {}),
@@ -66,11 +129,15 @@ export class TurnService {
         if (!result.text.trim() || result.text.length > (living ? 36000 : 12000)) throw new ServiceError('ACTOR_OUTPUT_INVALID', '回复未完成，请重试。', 502);
         const worldResult = living ? result as WorldTurnResult : undefined;
         const changes = validateChanges(result.changes, worldResult ? { ...turn.input, userText: observationText(worldResult.observations?.[turn.input.character.id]) } : turn.input);
-        const committed = runtime.streamDialogue && worldResult
-          ? await this.store.commitDialogue(turn, worldResult)
-          : await this.store.commit(turn, result.text, changes, { scene: result.scene, usage: result.usage,
+        // The store recognizes a rewrite from the frozen DB row (chat_type /
+        // target_turn_id / rewrite_reference.snapshotId) and restores + fences +
+        // archives inside the successful commit transaction. No extra options needed.
+        const commitOptions: CommitOptions = { scene: result.scene, usage: result.usage,
           ...(worldResult ? { replies: worldResult.replies, entityChanges: worldResult.entityChanges, activities: worldResult.activities, observations: worldResult.observations ?? {}, actorLocations: worldResult.actorLocations, storyTime: worldResult.storyTime, settledCharacterIds: worldResult.settledCharacterIds,
-            ...(deferred ? { settlement: worldResult, actorFirst } : {}) } : {}) });
+            ...(deferred ? { settlement: worldResult, actorFirst } : {}) } : {}) };
+        const committed = activeRuntime.streamDialogue && worldResult
+          ? await this.store.commitDialogue(turn, worldResult)
+          : await this.store.commit(turn, result.text, changes, commitOptions);
         emit({ type: 'committed', turnId: turn.id, ...committed });
         if (deferred) this.settlement.wake();
         return;
@@ -78,7 +145,7 @@ export class TurnService {
       let text = turn.draft;
       if (text === null) {
         emit({ type: 'phase', turnId: turn.id, phase });
-        const generated = await this.abortable(runtime.actor(turn.input, {
+        const generated = await this.abortable(activeRuntime.actor(actorInput, {
           signal: controller.signal,
           onTextDelta: (delta) => { if (!controller.signal.aborted) emit({ type: 'delta', turnId: turn.id, text: delta }); },
         }), controller.signal);
@@ -92,7 +159,8 @@ export class TurnService {
       }
       phase = 'settling';
       emit({ type: 'phase', turnId: turn.id, phase });
-      const result = await this.abortable(runtime.updateWorld({ ...turn.input, assistantText: text }, { signal: controller.signal }), controller.signal);
+      // WorldOps always receives the base Actor input (no operation reference data).
+      const result = await this.abortable(activeRuntime.updateWorld({ ...turn.input, assistantText: text }, { signal: controller.signal }), controller.signal);
       controller.signal.throwIfAborted();
       const changes = validateChanges(result.changes, turn.input);
       const committed = await this.store.commit(turn, text, changes, result.usage);
