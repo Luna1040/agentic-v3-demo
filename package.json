@@ -9,7 +9,7 @@
   "scripts": {
     "dev": "tsx server/index.ts",
     "start": "tsx server/index.ts --production",
-    "build": "vite build",
+    "build": "vite build && node scripts/check-consumer-build.mjs",
     "check": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts",
     "harness:build": "node scripts/build-harness.mjs",
@@ -24,7 +24,11 @@
     "db:backup": "tsx scripts/backup-local.ts",
     "db:import-characters": "tsx scripts/import-legacy-characters.ts",
     "db:import-sqlite": "tsx scripts/import-sqlite.ts",
-    "verify": "npm run harness:build && npm run check && npm test && npm run build"
+    "verify": "npm run harness:build && npm run check && npm test && npm run build && npm run build:admin",
+    "dev:admin": "tsx server/index.ts --admin",
+    "start:admin": "tsx server/index.ts --production --admin",
+    "build:admin": "vite build --mode admin",
+    "check:consumer-build": "node scripts/check-consumer-build.mjs"
   },
   "dependencies": {
     "express": "^5.1.0",

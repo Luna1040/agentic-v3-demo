@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import { Activity, ChevronRight, LoaderCircle, PanelRightClose, RotateCcw } from 'lucide-react';
-import type { Message, WorldView } from '../shared/contracts';
-import type { ApiClient } from './api';
+import type { Message, WorldView } from '../../shared/contracts';
+import type { AdminApiClient } from './api';
 import { CallTrace } from './CallTrace';
 import { callAgentLabel } from './agent-labels';
 import { displayValue } from './trace-model';
@@ -27,7 +27,7 @@ export function TracePanelHandle({ onExpand }: { onExpand: () => void }) {
  * and renders each call's recorded input and output in full without another click.
  */
 export function TracePanel({ client, messages, pendingTurnId, settlements, director, onCollapse, onDrawer }: {
-  client: ApiClient; messages: Message[]; pendingTurnId?: string | null;
+  client: AdminApiClient; messages: Message[]; pendingTurnId?: string | null;
   settlements?: WorldView['settlements']; director?: WorldView['director'];
   onCollapse: () => void; onDrawer: () => void;
 }) {

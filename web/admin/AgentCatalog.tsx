@@ -1,11 +1,11 @@
 import { useEffect, useState } from 'react';
 import { Archive, ArrowUpRight, LoaderCircle, RotateCcw } from 'lucide-react';
-import type { AgentKey } from '../shared/contracts';
-import type { ApiClient, LegacyAgentCatalogEntry } from './api';
+import type { AgentKey } from '../../shared/contracts';
+import type { AdminApiClient, LegacyAgentCatalogEntry } from './api';
 import { agentLabels } from './agent-labels';
 import { displayValue } from './trace-model';
 
-export function AgentCatalog({ client, available, onSelect }: { client: ApiClient; available: AgentKey[]; onSelect: (key: AgentKey) => void }) {
+export function AgentCatalog({ client, available, onSelect }: { client: AdminApiClient; available: AgentKey[]; onSelect: (key: AgentKey) => void }) {
   const [entries, setEntries] = useState<LegacyAgentCatalogEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');

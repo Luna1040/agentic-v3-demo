@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {createElement} from 'react';
 import {renderToStaticMarkup} from 'react-dom/server';
 import {MemoryDrawer} from '../web/MemoryDrawer';
-import {WorldInspection} from '../web/WorldInspector';
+import {WorldInspection} from '../web/admin/WorldInspector';
 import {createApiClient} from '../web/api';
 import type {WorldView} from '../shared/contracts';
 
@@ -33,11 +33,10 @@ test('completed extraction with unapplied candidates and open-ledger overflow is
  assert.ok(html.includes('当前仅展开 100 项'));assert.ok(html.includes('不能视为已经结束'));
 });
 
-test('chat drawer exposes scene and mainline by default even with zero legacy memories',()=>{
+test('consumer chat drawer exposes only its safe scene summary',()=>{
  const html=renderToStaticMarkup(createElement(MemoryDrawer,{world,creating:false,busy:false,client:createApiClient(),onWorld:()=>{},onRefresh:async()=>{},onContinue:()=>{},onClose:()=>{}}));
- for(const text of ['世界状态与剧情','完成早课并归还水笔','参与课堂','老师宣布下课','早课教室','艾米丽','归档待处理 2 轮','失败 1 轮','正在规划','角色记忆','物品','约定与任务'])assert.ok(html.includes(text),text);
- assert.ok(!html.includes('故事还很轻'));
- assert.match(html,/<details[^>]*open/);
+ for(const text of ['世界状态与剧情','早课教室','人物','物品','约定与任务']) assert.ok(html.includes(text),text);
+ for(const text of ['完成早课并归还水笔','参与课堂','老师宣布下课','正在规划','mainlinePlan','保存字段','队列与入库']) assert.ok(!html.includes(text),text);
 });
 test('modern character memory remains visible without a legacy player quotation',()=>{
  const html=renderToStaticMarkup(createElement(WorldInspection,{world,tab:'memory'}));

@@ -45,7 +45,7 @@ test('seven rapid completed replies remain usable while a held worker drains imm
         entityChanges: [{ op: 'update', baseVersion: item.version, entity: { id: itemId, kind: 'item', name: '信封', description: '连续交谈中的同一封信', state: { step } } }] };
     });
   }
-  const app = createApp({ store: db.store, runtime, authenticate: () => 'alice', developer: { authorize: () => true, defaultPrompts: { actor: 'test', main: 'test', updater: 'test' }, buildRuntime: async () => runtime } });
+  const app = createApp({ audience: 'admin', store: db.store, runtime, authenticate: () => 'alice', developer: { authorize: () => true, defaultPrompts: { actor: 'test', main: 'test', updater: 'test' }, buildRuntime: async () => runtime } });
   const server = app.listen(0, '127.0.0.1'); await new Promise<void>(resolve => server.once('listening', resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   try {

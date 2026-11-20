@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
-import type { TurnTrace } from '../shared/contracts';
-import type { ApiClient } from './api';
+import type { TurnTrace } from '../../shared/contracts';
+import type { AdminApiClient } from './api';
 
 export interface TraceHints { settlementStatus?: string; directorStatus?: string }
 
@@ -19,7 +19,7 @@ function stillRunning(trace: TurnTrace, hints: TraceHints): boolean {
  * Read one turn's recorded Agent calls and keep polling while the turn or its background work is running.
  * A poll that returns unchanged evidence does not re-render the callers.
  */
-export function useTurnTrace(client: ApiClient, turnId: string, hints: TraceHints = {}) {
+export function useTurnTrace(client: AdminApiClient, turnId: string, hints: TraceHints = {}) {
   const [trace, setTrace] = useState<TurnTrace | null>(null);
   const [error, setError] = useState('');
   const [retryKey, setRetryKey] = useState(0);

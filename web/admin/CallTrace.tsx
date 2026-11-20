@@ -1,5 +1,5 @@
 import { Activity, ChevronRight, Clock3 } from 'lucide-react';
-import type { AgentCallRecord, ModelUsage } from '../shared/contracts';
+import type { AgentCallRecord, ModelUsage } from '../../shared/contracts';
 import { callAgentLabel } from './agent-labels';
 import { actorRecallSummary } from './time-model';
 import { callCharacterLabel, callForest, displayValue, type CallNode } from './trace-model';

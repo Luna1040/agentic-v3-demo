@@ -1,6 +1,7 @@
+import { actorRecallSummary } from '../web/admin/time-model';
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { storyTimeLabel, recordedTimeLabel, actorRecallSummary } from '../web/time-model.ts';
+import { storyTimeLabel, recordedTimeLabel } from '../web/time-model.ts';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { EntityCard } from '../web/WorldArchive.tsx';
@@ -37,14 +38,14 @@ test('developer recall summary counts only the actual actor packet and exposes i
   assert.deepEqual(summary?.records[0]?.matches, ['归还书本']);
 });
 
-test('scene, quest and memory render story chronology separately from real record dates', () => {
+test('scene and memory retain story time while consumer quest cards omit internal planning', () => {
   const time = { day: 3, minute: null, period: 'afternoon' as const, precision: 'period' as const, source: { kind: 'user_explicit' as const, turnId: 'turn-1', quote: '第三天下午' } };
   const quest: WorldEntity = { id: 'quest', kind: 'quest', name: '归还旧书', description: '次日归还', state: { status: 'active', storyDue: { day: 4, minute: 990, precision: 'minute' }, progression: { phase: '等待赴约', completedMilestones: ['已借出旧书'], nextStep: '次日在书店归还' } }, knownByCharacterIds: [], sourceTurnId: 'turn-1', createdAt: '2026-10-22T08:00:00Z', updatedAt: '2026-10-22T08:00:00Z' };
   const world: WorldView = { id: 'world', title: '故事', revision: 1, createdAt: quest.createdAt, storyTime: time, events: [], entities: [quest] };
   const sceneHtml = renderToStaticMarkup(createElement(SceneStrip, { world, characters: [], busy: false, onEdit: () => {} }));
   assert.match(sceneHtml, /故事第 3 天 · 下午/); assert.doesNotMatch(sceneHtml, /00:00/);
   const questHtml = renderToStaticMarkup(createElement(EntityCard, { entity: quest, entities: [quest], templates: [], busy: false, onScene: () => {} }));
-  assert.match(questHtml, /故事第 4 天 · 16:30/); assert.match(questHtml, /已借出旧书/); assert.match(questHtml, /下一步意向/);
+  assert.doesNotMatch(questHtml, /故事第 4 天|已借出旧书|下一步意向|progression/);
   const memoryHtml = renderToStaticMarkup(createElement(MemoryEntry, { event: { id: 'event', kind: 'event', text: '我借走了书。', characterId: 'a', visibility: 'private', sourceTurnId: 'turn-1', createdAt: quest.createdAt, storyTime: time, status: 'active', evidence: { source: 'user', turnId: 'turn-1' } }, disabled: false, saving: false, onChange: () => {} }));
   assert.match(memoryHtml, /记录于/); assert.match(memoryHtml, /故事第 3 天 · 下午/);
 });

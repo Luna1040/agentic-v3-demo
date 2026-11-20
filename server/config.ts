@@ -55,5 +55,6 @@ export function runtimeSettings(env: NodeJS.ProcessEnv = process.env) {
 }
 export function serverSettings(env: NodeJS.ProcessEnv = process.env) {
   return { port: integer(env.PORT, 7633, 'PORT', 1, 65535),
+    adminPort: integer(env.ADMIN_PORT, 7634, 'ADMIN_PORT', 1, 65535),
     harnessPath: env.HARNESS_MODULE_PATH || resolve(env.HARNESS_ROOT || resolve(projectRoot, '../../roleplay-harness'), 'dist/apps/agentic-v3/index.js') };
 }

@@ -22,7 +22,7 @@ test('actual browser client → HTTP/SSE → PostgreSQL → Harness Agent/Pi pre
     status: { provider: 'demo', model: harness.status.model, harness: { loaded: true, version: harness.status.harnessVersion }, offlineSimulation: false },
   };
   const fixture = await postgresFixture();
-  const app = createApp({ store: fixture.store, runtime });
+  const app = createApp({ store: fixture.store, runtime, authenticate: () => 'local' });
   const server = app.listen(0, '127.0.0.1');
   await new Promise<void>(done => server.once('listening', done));
   const api = createApiClient({ baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}/api` });

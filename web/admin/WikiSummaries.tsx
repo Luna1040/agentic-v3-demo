@@ -1,5 +1,5 @@
-import type {WorldView} from '../shared/contracts';
-import {ReadingText} from './ChatMessage';
+import type {WorldView} from '../../shared/contracts';
+import {ReadingText} from '../ChatMessage';
 
 /** A sourced projection, deliberately separate from committed entity facts. */
 export function WikiSummaries({world}:{world:WorldView}){

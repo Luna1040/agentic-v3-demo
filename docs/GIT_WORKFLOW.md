@@ -22,6 +22,8 @@ git push origin main
 
 使用已经配置 SSH 的电脑：
 
+首次升级为双入口前，先按 [入口与身份](ENTRY_POINTS.md) 配置可信身份网关、服务端共享密钥和独立的 `agentic-v3-admin.service`。旧的统一 `local` 身份与 `ENABLE_DEVELOPER_TOOLS=true` 不再适用于生产。
+
 ```powershell
 ssh my-remote-server "bash /opt/AgenticV3/scripts/deploy-remote.sh"
 ```
@@ -34,13 +36,13 @@ ssh my-remote-server "bash /opt/AgenticV3/scripts/deploy-remote.sh"
 ssh my-remote-server "bash /opt/AgenticV3/scripts/deploy-remote.sh --check"
 ```
 
-流程为：拉取 → 独立候选目录安装所需依赖、类型检查与构建 → 校验 Harness 锁定版本与活动任务 → 数据库和源代码备份 → 停服务后复查 → 数据库迁移 → 向前更新代码与替换构建 → 启动并检查健康。
+流程为：拉取 → 独立候选目录安装锁定依赖、类型检查与两份构建 → 校验身份配置、Harness 锁定版本与活动任务 → 保存旧源码 → 停止两服务后复查并备份数据库 → 数据库迁移 → 向前更新代码与替换两份构建 → 启动并分别检查健康。相同 Git 提交也重新检查和构建，避免上次发布中断后误报成功。
 
 预检同时核对数据库已应用迁移的校验和。迁移 SQL 使用原始字节保存，Git 不转换换行；不能修改已应用迁移或通过改数据库中的校验和绕过检查。结构变更应新增迁移。
 
 有正在生成的聊天或后台 Agent 时会停止本次部署；用户稍后重试即可。后台 pending 任务保留在数据库，不会重建数据库、导入角色卡或自动发布 Prompt。数据库迁移失败前不会更新当前 Git 提交。
 
-更新脚本要求当前部署环境的 root 权限、systemd、PostgreSQL 和既有迁移配置。它不是通用托管平台脚本。备份在 `/opt/AgenticV3-backups/git-<UTC时间>/`，含旧提交号、Git bundle、数据库快照及替换后的旧构建；候选目录为私有目录，包含本机配置，不能上传仓库。
+更新脚本要求当前部署环境的 root 权限、两个 systemd 服务、PostgreSQL 和既有迁移配置。它不是通用托管平台脚本。备份在 `/opt/AgenticV3-backups/git-<UTC时间>/`，含旧提交号、Git bundle、数据库快照及替换后的旧构建；旧 `dist/verification` 仅随旧构建进入私有备份，不复制到新站点。候选目录包含本机配置，不能上传仓库。部署中断后检查两服务和备份；脚本不自动回滚数据库迁移。
 
 ## Harness 变更
 

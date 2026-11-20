@@ -16,7 +16,7 @@ test('living world browser client → HTTP → PG → real Harness/Pi tool execu
   const harness = createStoryRuntime({mode:'demo',delayMs:0,readDialogue:(request:any)=>fixture.store.readDialogueForSource(request)});
   const runtime: StoryRuntime = { ...harness, status:{ provider:'demo',model:harness.status.model,harness:{loaded:true,version:harness.status.harnessVersion},offlineSimulation:true } };
   assert.equal(typeof runtime.runWorldTurn,'function');
-  const app = createApp({store:fixture.store,runtime});
+  const app = createApp({store:fixture.store,runtime,authenticate:()=>'local'});
   const server = app.listen(0,'127.0.0.1');
   await new Promise<void>(done => server.once('listening',done));
   const api = createApiClient({baseUrl:`http://127.0.0.1:${(server.address() as AddressInfo).port}/api`});
@@ -53,7 +53,7 @@ test('living world browser client → HTTP → PG → real Harness/Pi tool execu
     const next = await api.createSession({characterId:npc.id,worldId:initial.world.id,dynamicOpening:true,scene:{location:'旧书店',presentCharacterIds:[npc.id],mode:'direct'},expectedRevision:settled.revision});
     const packet = await fixture.store.previewInput('local',next.session.id,'刚才你说了什么？');
     assert((await readPastDialogue(fixture.store,'local',next.session.id,npc.id)).some(episode=>episode.replies.some(reply=>reply.characterId===npc.id)));
-    await assert.rejects(api.createSession({characterId:'shen-yan',worldId:initial.world.id,dynamicOpening:false}),/只能选择这个世界/);
+    await assert.rejects(api.createSession({characterId:'shen-yan',worldId:initial.world.id,dynamicOpening:false}),{code:'NOT_FOUND',status:404});
   } finally {
     await app.locals.shutdown(); server.closeAllConnections();
     await new Promise<void>(done => server.close(() => done())); await fixture.cleanup();

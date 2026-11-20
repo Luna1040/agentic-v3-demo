@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { WorldView } from '../shared/contracts';
 import { createApiClient } from '../web/api';
-import { promptDraftKey, readPromptDrafts, writePromptDrafts } from '../web/prompt-drafts';
+import { promptDraftKey, readPromptDrafts, writePromptDrafts } from '../web/admin/prompt-drafts';
 import { sceneDraft, sceneDraftReducer, scenePatch } from '../web/scene-state';
 import { filterSessions } from '../web/session-presentation';
 
