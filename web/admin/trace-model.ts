@@ -1,4 +1,4 @@
-import type { AgentCallRecord, AgentTestResult } from '../shared/contracts';
+import type { AgentCallRecord, AgentTestResult } from '../../shared/contracts';
 export interface CallNode { call: AgentCallRecord; children: CallNode[] }
 /** Parent links are evidence from the server; missing/cyclic parents stay visible. */
 export function callForest(calls: AgentCallRecord[]): CallNode[] {

@@ -1,4 +1,4 @@
-import type { RuntimeAuditView } from '../shared/contracts';
+import type { RuntimeAuditView } from '../../shared/contracts';
 
 export type AuditEvent = RuntimeAuditView['events'][number];
 export const auditEventLabels: Record<string, string> = {

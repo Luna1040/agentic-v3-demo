@@ -1,4 +1,4 @@
-import type { AgentKey } from '../shared/contracts';
+import type { AgentKey } from '../../shared/contracts';
 
 export type PromptDrafts = Partial<Record<AgentKey, string>>;
 type DraftStorage = Pick<Storage, 'getItem' | 'setItem'>;

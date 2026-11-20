@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { Download, LoaderCircle, Play, RotateCcw } from 'lucide-react';
-import type { RuntimeAuditView } from '../shared/contracts';
-import { ApiError, type ApiClient } from './api';
-import { recordedTimeLabel } from './time-model';
+import type { RuntimeAuditView } from '../../shared/contracts';
+import { ApiError, type AdminApiClient } from './api';
+import { recordedTimeLabel } from '../time-model';
 import { auditBatches, auditEventLabels, auditFieldChanges, auditFieldSource, auditObject, auditRowChanges, auditTurnIds, auditValue, foregroundLabels, settlementLabels, type AuditEvent, type AuditFieldChange } from './runtime-audit-model';
 
 function Source({ id }: { id?: string | null }) { return <code title={id || undefined}>{id ? '#' + id.slice(-8) : '来源未记录'}</code>; }
@@ -77,7 +77,7 @@ function exportAudit(worldId: string, view: RuntimeAuditView) {
   // Delay revocation until the browser has started reading the download.
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
-export function RuntimeAudit({ worldId, client }: { worldId: string; client: ApiClient }) {
+export function RuntimeAudit({ worldId, client }: { worldId: string; client: AdminApiClient }) {
   const [view, setView] = useState<RuntimeAuditView | null>(null);
   const [error, setError] = useState('');
   const [capturing, setCapturing] = useState(false);

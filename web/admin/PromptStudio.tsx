@@ -1,16 +1,16 @@
 import { useEffect, useRef, useState } from 'react';
 import { ArrowLeft, Download, FlaskConical, LoaderCircle, Play, RotateCcw, Save, Square } from 'lucide-react';
-import type { AgentKey, AgentPromptConfig, AgentTestResult, Session, WorldView } from '../shared/contracts';
-import type { ApiClient } from './api';
+import type { AgentKey, AgentPromptConfig, AgentTestResult, Session, WorldView } from '../../shared/contracts';
+import type { AdminApiClient } from './api';
 import { CallTrace, Usage } from './CallTrace';
 import { displayValue, testFailureSummary } from './trace-model';
-import { sessionPresentation } from './session-presentation';
+import { sessionPresentation } from '../session-presentation';
 import { readPromptDrafts, writePromptDrafts } from './prompt-drafts';
 
 import { agentLabels as labels, agentTestHelp } from './agent-labels';
 import { AgentCatalog } from './AgentCatalog';
 const PROMPT_LIMIT = 12000;
-export function PromptStudio({ client, sessions, worlds, initialSessionId, draftNamespace, onBack }: { client: ApiClient; sessions: Session[]; worlds?: WorldView[]; initialSessionId: string | null; draftNamespace?: string; onBack: () => void }) {
+export function PromptStudio({ client, sessions, worlds, initialSessionId, draftNamespace, onBack }: { client: AdminApiClient; sessions: Session[]; worlds?: WorldView[]; initialSessionId: string | null; draftNamespace?: string; onBack: () => void }) {
   const [configs, setConfigs] = useState<AgentPromptConfig[]>([]);
   const [drafts, setDrafts] = useState<Partial<Record<AgentKey, string>>>(() => readPromptDrafts(draftNamespace));
   const [agent, setAgent] = useState<AgentKey>('main');
@@ -28,6 +28,14 @@ export function PromptStudio({ client, sessions, worlds, initialSessionId, draft
   const [testedInput, setTestedInput] = useState<{ agent: AgentKey; sessionId: string; prompt: string; userText: string; assistantText: string } | null>(null);
   const testController = useRef<AbortController | null>(null);
   const saveController = useRef<AbortController | null>(null);
+  useEffect(() => {
+    testController.current?.abort();
+    testController.current = null;
+    setRunning(false);
+    setSessionId(initialSessionId || sessions[0]?.id || '');
+    setResult(null);
+    setTestedInput(null);
+  }, [initialSessionId]);
   const config = configs.find(item => item.key === agent);
   function exportEnabledPrompts() {
     const bundle = { format: 'agentic-v3-runtime-prompts-v1', exportedAt: new Date().toISOString(), prompts: Object.fromEntries(configs.map(item => [item.key, { version: item.version, model: item.model, content: item.content }])) };

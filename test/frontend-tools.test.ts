@@ -1,3 +1,4 @@
+import { createAdminApiClient } from '../web/admin/api';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createElement } from 'react';
@@ -5,8 +6,8 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import type { AgentCallRecord, Character, Session } from '../shared/contracts';
 import { ApiError, createApiClient } from '../web/api';
 import { filterCharacters, imageUrl, recentCharacters } from '../web/catalog';
-import { callCharacterLabel, callForest, testFailureSummary } from '../web/trace-model';
-import { CallTrace, Usage } from '../web/CallTrace';
+import { callCharacterLabel, callForest, testFailureSummary } from '../web/admin/trace-model';
+import { CallTrace, Usage } from '../web/admin/CallTrace';
 import { lastSessionKey, resolveInitialSession, sessionPresentation } from '../web/session-presentation';
 
 const character = (id: string, fields: Partial<Character> = {}): Character => ({ id, name: id, subtitle: '', description: '', greeting: '', initial: '角', color: 'sage', source: 'legacy', language: 'zh', ...fields });
@@ -70,7 +71,7 @@ test('trial errors remain prominent without requiring a call record, and empty t
 test('scene, trace, prompt saving and explicit testing share the injected auth and cancellation contract', async () => {
   const calls: { url: string; init?: RequestInit }[] = [];
   const signal = new AbortController().signal;
-  const client = createApiClient({ baseUrl: 'https://host.test/feature/api/', getHeaders: () => ({ Authorization: 'fixture' }), fetch: async (url, init) => { calls.push({ url: String(url), init }); return Response.json({}); } });
+  const client = createAdminApiClient({ baseUrl: 'https://host.test/feature/api/', getHeaders: () => ({ Authorization: 'fixture' }), fetch: async (url, init) => { calls.push({ url: String(url), init }); return Response.json({}); } });
   await client.trace('turn/one', { signal });
   await client.updateScene('world/one', { expectedRevision: 7, scene: { location: '书店', presentCharacterIds: ['c1'] } }, { signal });
   await client.prompts({ signal });
@@ -91,7 +92,7 @@ test('scene, trace, prompt saving and explicit testing share the injected auth a
 });
 
 test('version conflicts stay structured for scene and prompt recovery', async () => {
-  const client = createApiClient({ fetch: async () => Response.json({ error: { code: 'PROMPT_VERSION_CONFLICT', message: '已被更新' } }, { status: 409 }) });
+  const client = createAdminApiClient({ fetch: async () => Response.json({ error: { code: 'PROMPT_VERSION_CONFLICT', message: '已被更新' } }, { status: 409 }) });
   await assert.rejects(client.savePrompt('main', { content: 'draft', expectedVersion: 1 }), (error: unknown) => error instanceof ApiError && error.code === 'PROMPT_VERSION_CONFLICT' && error.status === 409);
 });
 

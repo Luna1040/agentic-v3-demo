@@ -1,5 +1,5 @@
-import type { AgentKey } from '../shared/contracts';
-import type { AgentCallRecord } from '../shared/contracts';
+import type { AgentKey } from '../../shared/contracts';
+import type { AgentCallRecord } from '../../shared/contracts';
 export function callAgentLabel(call:AgentCallRecord):string { return call.delegateKey ? oldAgentLabels[call.delegateKey] ?? call.delegateKey : agentLabels[call.agent] ?? call.agent; }
 export const oldAgentLabels:Record<string,string>={phase1_actor:'Phase1 Actor · 早期演员',scene_conductor:'Scene Conductor · 场景导演',character_actor:'Character Actor · 角色演员',opening_director:'Opening Director · 开场导演',teacher_worldops:'Teacher WorldOps · 记忆与物品',knowledge_audit:'Knowledge Audit · 知情审查',user_agency_audit:'User Agency Audit · 自主权审查',wiki_summarizer:'Wiki Summarizer · 档案摘要',world_arbiter:'World Arbiter · 冲突裁决',quest_keeper:'Quest Keeper · 任务约定',world_pulse_planner:'World Pulse Planner · 离线规划',location_generator:'Location Generator · 地点维护',encounter_resolver:'Encounter Resolver · 遭遇人物',delivery_formatter:'Delivery Formatter · 交付检查',auto_reply:'Auto Reply · 返场邀请',world_orchestrator:'Main · World Orchestrator',scene_locator:'Scene Locator · 当前定位'};
 export const agentLabels: Record<AgentKey, string> = { main: 'Main · 主线规划', actor: 'Actor · 场景演绎', updater: 'WorldOps · 世界更新', opening: 'Opening · 开场导演', pulse: 'Pulse · 世界动态', arbiter: 'Arbiter · 冲突裁决' };

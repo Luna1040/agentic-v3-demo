@@ -1,13 +1,13 @@
 import { useState } from 'react';
 import { LoaderCircle, RotateCcw } from 'lucide-react';
-import type { Message, WorldView } from '../shared/contracts';
-import type { ApiClient } from './api';
+import type { Message, WorldView } from '../../shared/contracts';
+import type { AdminApiClient } from './api';
 import { CallTrace } from './CallTrace';
-import { Drawer } from './Drawer';
+import { Drawer } from '../Drawer';
 import { displayValue } from './trace-model';
 import { useTurnTrace } from './use-turn-trace';
 
-export function TraceDrawer({ client, messages, pendingTurnId, settlements, director, onClose }: { client: ApiClient; messages: Message[]; pendingTurnId?: string | null; settlements?: WorldView['settlements']; director?: WorldView['director']; onClose: () => void }) {
+export function TraceDrawer({ client, messages, pendingTurnId, settlements, director, onClose }: { client: AdminApiClient; messages: Message[]; pendingTurnId?: string | null; settlements?: WorldView['settlements']; director?: WorldView['director']; onClose: () => void }) {
   const ids = [...new Set([...(pendingTurnId ? [pendingTurnId] : []), ...[...messages].reverse().flatMap(message => message.turnId ? [message.turnId] : [])])];
   const [chosen, setChosen] = useState('');
   const id = chosen && ids.includes(chosen) ? chosen : ids[0] || '';

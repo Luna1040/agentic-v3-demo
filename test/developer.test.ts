@@ -18,7 +18,7 @@ async function withApp(work: (context: { base: string; sessionId: string; db: Aw
   const db = await postgresFixture();
   await db.store.ensurePromptDefaults(defaults);
   const session = await db.store.createSession('alice', 'lin-wan');
-  const app = createApp({ store: db.store, runtime: buildRuntime(), authenticate: req => req.get('x-owner') || 'alice',
+  const app = createApp({ audience: 'admin', store: db.store, runtime: buildRuntime(), authenticate: req => req.get('x-owner') || 'alice',
     resolveRuntime: async () => buildRuntime((await promptSnapshot(db.store, defaults)).prompts),
     developer: { authorize: req => req.get('x-developer') === 'yes', defaultPrompts: defaults, buildRuntime: async prompts => buildRuntime(prompts) },
   });
@@ -30,14 +30,13 @@ async function withApp(work: (context: { base: string; sessionId: string; db: Aw
   finally { await app.locals.shutdown(); server.closeAllConnections(); await new Promise<void>(done => server.close(() => done())); await db.cleanup(); }
 }
 
-test('developer permission gates prompt reads/writes and traces while normal chat stays accessible', async () => {
+test('admin permission gates prompt reads/writes, traces and ordinary application APIs', async () => {
   await withApp(async ({ request, sessionId }) => {
     assert.equal((await request('/dev/prompts', 'GET', undefined, false)).status, 403);
     assert.equal((await request('/dev/prompts/actor', 'PUT', { content: 'bad', expectedVersion: 1 }, false)).status, 403);
     assert.equal((await request('/turns/nonexistent/trace', 'GET', undefined, false)).status, 403);
-    const regular = await (await request('/bootstrap', 'GET', undefined, false)).json();
-    assert.equal(regular.status.developerTools, false);
-    assert.equal((await request(`/sessions/${sessionId}`, 'GET', undefined, false)).status, 200);
+    assert.equal((await request('/bootstrap', 'GET', undefined, false)).status, 403);
+    assert.equal((await request(`/sessions/${sessionId}`, 'GET', undefined, false)).status, 403);
   });
 });
 

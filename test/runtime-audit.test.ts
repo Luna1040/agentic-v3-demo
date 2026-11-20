@@ -80,7 +80,7 @@ test('real wait, rebase, split and failure observations preserve source/batch/at
 test('runtime audit API requires developer permission and excludes automatic openings from capture turn count',async()=>{
  const f=await postgresFixture({livingWorld:true});
  const runtime:StoryRuntime={status:{provider:'demo',model:'fixture',harness:{loaded:true,version:'test'},offlineSimulation:false},actor:async()=>({text:'test'}),updateWorld:async()=>({changes:[]})};
- const app=createApp({store:f.store,runtime,authenticate:req=>req.get('x-owner')||'alice',developer:{authorize:req=>req.get('x-dev')==='yes',defaultPrompts:{main:'m',actor:'a',updater:'u'},buildRuntime:async()=>runtime}});
+ const app=createApp({audience:'admin',store:f.store,runtime,authenticate:req=>req.get('x-owner')||'alice',developer:{authorize:req=>req.get('x-dev')==='yes',defaultPrompts:{main:'m',actor:'a',updater:'u'},buildRuntime:async()=>runtime}});
  const server=app.listen(0,'127.0.0.1');await new Promise<void>(resolve=>server.once('listening',resolve));
  try{
   const s=await f.store.createSession('alice','lin-wan',undefined,{dynamicOpening:true});const base=`http://127.0.0.1:${(server.address() as AddressInfo).port}/api/worlds/${s.world.id}/runtime-audit`;

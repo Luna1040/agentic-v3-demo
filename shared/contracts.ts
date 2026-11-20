@@ -80,7 +80,8 @@ export interface RuntimeAuditView {
   truncated:boolean;
 }
 export interface Bootstrap {
-  characters: Character[]; sessions: Session[]; worlds: WorldView[]; status: RuntimeStatus;
+  characters: Character[]; sessions: Session[]; worlds: WorldView[];
+  status: Pick<RuntimeStatus, 'provider'> & Partial<Omit<RuntimeStatus, 'provider'>>;
 }
 export interface SessionDetail { session: Session; messages: Message[]; world: WorldView; hasMore: boolean; nextBefore: string | null }
 export type TurnStatus = 'running' | 'committed' | 'failed' | 'cancelled';

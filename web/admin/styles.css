@@ -1,0 +1,122 @@
+.agentic-app .av-prompt-draft-tools select { min-width: 0; max-width: 100%; padding: 9px 10px; border: 1px solid #e8d7e1; border-radius: 7px; background: #fff; color: #7c5c70; font: inherit; }
+.agentic-app .av-trace-status { margin: 20px 0; font-size: 11px; color: #9b6482; }
+.agentic-app .av-call-attempt { margin: 20px 0 27px; }
+.agentic-app .av-call-attempt > h3 { display: flex; justify-content: space-between; font-size: 11px; font-weight: 500; color: #906a82; margin-bottom: 12px; }
+.agentic-app .av-call-attempt > h3 span { color: #947c8b; font: 12px ui-monospace, monospace; }
+.agentic-app .av-call { border: 1px solid #e6d6e0; background: #fff; border-radius: 9px; padding: 13px; margin-bottom: 10px; min-width: 0; }
+.agentic-app .av-call-heading { display: flex; justify-content: space-between; gap: 9px; font-size: 10px; align-items: center; }
+.agentic-app .av-call-heading strong { display: flex; align-items: center; gap: 6px; color: #75566c; font-size: 11px; }
+.agentic-app .av-call-heading > span { color: #8b7a85; font-size: 9px; }
+.agentic-app .av-call.is-running { border-color: #d7a3bc; }
+.agentic-app .av-call.is-failed { border-color: #d995a8; }
+.agentic-app .av-call-model { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; color: #9b7c90; margin: 9px 0; overflow-wrap: anywhere; }
+.agentic-app .av-call-model > span:last-child { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.agentic-app .av-usage { display: block; font: 12px/1.8 ui-monospace, monospace; color: #8d7485; overflow-wrap: anywhere; }
+.agentic-app .av-call-children { padding-left: 16px; margin-left: 11px; border-left: 1px solid #e2c7d7; }
+.agentic-app .av-call details, .agentic-app .av-test-result details { margin-top: 11px; font-size: 10px; }
+.agentic-app .av-call summary, .agentic-app .av-test-result summary { display: flex; align-items: center; gap: 4px; cursor: pointer; color: #926781; list-style: none; }
+.agentic-app .av-call details[open] summary svg { transform: rotate(90deg); }
+.agentic-app .av-call pre, .agentic-app .av-test-result pre { padding: 11px; margin-top: 9px; background: #f9f5f7; border-radius: 6px; color: #6d5965; font: 12px/1.7 ui-monospace, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 340px; overflow: auto; }
+.agentic-app .av-trace-empty { text-align: center; padding: 35px 12px; color: #a48496; }
+.agentic-app .av-trace-empty p { font-size: 12px; margin: 14px 0; }
+.agentic-app .av-trace-empty small { font-size: 10px; line-height: 1.9; }
+.agentic-app .av-prompt-studio { flex: 1; min-height: 0; overflow: auto; padding: 23px 30px 40px; }
+.agentic-app .av-agent-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 22px; }
+.agentic-app .av-agent-tabs button { padding: 10px 14px; border: 1px solid #e8d8e2; border-radius: 8px; color: #98738a; font-size: 10px; }
+.agentic-app .av-agent-tabs button.is-active { background: #f3e2ec; color: #965e7c; border-color: #dcb8ce; }
+.agentic-app .av-prompt-columns { display: grid; grid-template-columns: minmax(0, 1.12fr) minmax(0, 1fr); gap: 20px; align-items: start; }
+.agentic-app .av-prompt-columns > section, .agentic-app .av-test-result { border: 1px solid #e7d5e0; border-radius: 11px; padding: 20px; background: #fffcfd; min-width: 0; }
+.agentic-app .av-field .av-prompt-text { min-height: 350px; font: 12px/1.9 ui-monospace, Consolas, monospace; tab-size: 2; }
+.agentic-app .av-prompt-draft-tools { display: flex; gap: 8px; flex-wrap: wrap; }
+.agentic-app .av-prompt-draft-tools > * { flex: 1; font-size: 9px; }
+.agentic-app .av-prompt-save { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 19px; }
+.agentic-app .av-prompt-save > span { font-size: 9px; color: #9e7b90; }
+.agentic-app .av-test-actions { display: flex; align-items: center; gap: 10px; margin-top: 20px; }
+.agentic-app .av-test-actions > span { display: flex; align-items: center; gap: 5px; font-size: 9px; color: #a06f8c; }
+.agentic-app .av-prompt-notice { padding: 12px 15px; border: 1px solid #e4d0dd; border-radius: 8px; background: #f8edf3; font-size: 11px; color: #946b83; margin: 17px 0; }
+.agentic-app .av-test-result { margin-top: 22px; }
+.agentic-app .av-test-result > h3 { margin-top: 22px; color: #8c647e; font-size: 13px; }
+.agentic-app .av-trace-metadata { font-size: 10px; color: #94748a; padding-top: 15px; border-top: 1px solid #e9d9e3; }
+.agentic-app .av-trace-metadata summary { cursor: pointer; }
+.agentic-app .av-trace-metadata pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; background: #f6eef3; border-radius: 7px; margin-top: 10px; color: #75616e; font: 12px/1.8 ui-monospace, Consolas, monospace; }
+@media (max-width: 1150px) { .agentic-app .av-prompt-columns { grid-template-columns: 1fr; } }
+@media (max-width: 760px) {
+  .agentic-app .av-prompt-studio { padding: 18px 16px 30px; }
+  .agentic-app .av-prompt-columns > section, .agentic-app .av-test-result { padding: 16px; }
+  .agentic-app .av-prompt-save { flex-wrap: wrap; }
+}
+.agentic-app .av-audit-table-wrap { max-width: 100%; overflow-x: auto; margin-top: 12px; }
+.agentic-app .av-audit-table { width: 100%; border-collapse: collapse; font-size: 12px; line-height: 1.7; table-layout: fixed; }
+.agentic-app .av-audit-table th, .agentic-app .av-audit-table td { padding: 9px; border: 1px solid var(--av-line); text-align: left; vertical-align: top; white-space: pre-wrap; overflow-wrap: anywhere; }
+.agentic-app .av-audit-table th { font-weight: 500; background: #fcf3f8; }
+.agentic-app .av-audit-turn { padding: 12px 0; border-top: 1px solid var(--av-line); }
+.agentic-app .av-audit-source { display: inline-block; margin-right: 8px; }
+.agentic-app .av-agent-catalog { border: 1px solid #e6d6e1; border-radius: 12px; background: #fffafd; margin-bottom: 20px; }
+.agentic-app .av-agent-catalog > summary { display: flex; align-items: center; gap: 9px; cursor: pointer; padding: 15px 17px; color: #90647f; }
+.agentic-app .av-agent-catalog > summary strong { font-size: 13px; font-weight: 500; }
+.agentic-app .av-agent-catalog > summary > span { margin-left: auto; font-size: 11px; color: #a28296; }
+.agentic-app .av-agent-catalog-body { padding: 0 17px 17px; }
+.agentic-app .av-agent-catalog-body > p { font-size: 12px; line-height: 1.9; color: #967a8c; margin-bottom: 14px; }
+.agentic-app .av-legacy-agent-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); align-items: start; gap: 10px; }
+.agentic-app .av-legacy-agent { min-width: 0; border: 1px solid #eee1e9; border-radius: 9px; background: white; }
+.agentic-app .av-legacy-agent > summary { cursor: pointer; padding: 13px; }
+.agentic-app .av-legacy-agent summary > strong { display: block; font-size: 12px; font-weight: 500; }
+.agentic-app .av-legacy-agent summary > small { display: block; color: #9e8494; font-size: 11px; margin-top: 6px; overflow-wrap: anywhere; }
+.agentic-app .av-legacy-agent > div { padding: 0 13px 13px; }
+.agentic-app .av-legacy-agent p { font-size: 12px; line-height: 1.8; overflow-wrap: anywhere; }
+.agentic-app .av-agent-mapping { color: #98748a; margin-top: 10px !important; }
+.agentic-app .av-agent-links { display: flex; flex-wrap: wrap; gap: 7px; margin: 13px 0; }
+.agentic-app .av-legacy-agent details { margin-top: 10px; }
+.agentic-app .av-legacy-agent details summary { font-size: 12px; color: #9d708a; cursor: pointer; line-height: 1.8; }
+.agentic-app .av-legacy-agent pre { max-height: 400px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; border-radius: 8px; background: #f8f2f6; font: 12px/1.8 ui-monospace, Consolas, monospace; color: #775d6e; }
+@media (max-width: 700px) {
+  .agentic-app .av-legacy-agent-grid { grid-template-columns: 1fr; }
+  .agentic-app .av-agent-catalog > summary { flex-wrap: wrap; }
+}
+
+.agentic-app .av-prompt-version-notice { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; color: #715062; font-size: 12px; }
+.agentic-app .av-prompt-version-notice > div { flex: 1; min-width: 190px; }
+.agentic-app .av-prompt-version-notice p { margin: 5px 0 0; line-height: 1.65; }
+.agentic-app .av-prompt-version-notice .av-button { font-size: 12px; }
+.agentic-app .av-call-heading strong { flex-wrap: wrap; }
+.agentic-app .av-call-character { color: #80516b; font-size: 12px; font-weight: 600; }
+.agentic-app .av-trace-panel { display: flex; flex-direction: column; flex: 0 0 468px; width: 468px; min-width: 0; min-height: 0; border-left: 1px solid var(--av-line); background: #fefafb; z-index: 18; }
+.agentic-app .av-trace-panel.is-collapsed { flex: 0 0 42px; width: 42px; align-items: center; padding-top: 24px; }
+.agentic-app .av-trace-handle { display: flex; flex-direction: column; align-items: center; gap: 13px; width: 40px; padding: 13px 0; border-radius: 9px; color: #a78b9b; }
+.agentic-app .av-trace-handle span { writing-mode: vertical-rl; font-size: 10px; letter-spacing: 2px; }
+.agentic-app .av-trace-handle svg:last-child { transform: rotate(180deg); }
+.agentic-app .av-trace-handle:hover { color: var(--av-rose-deep); background: #f8eaf1; }
+.agentic-app .av-trace-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex: 0 0 auto; min-height: 88px; padding: 17px 16px; border-bottom: 1px solid var(--av-line); background: #fffdfdbb; }
+.agentic-app .av-trace-panel-head h2 { margin-top: 8px; font-size: 15px; font-weight: 500; letter-spacing: .5px; color: #6b5261; }
+.agentic-app .av-trace-panel-tools { display: flex; align-items: center; gap: 3px; }
+.agentic-app .av-trace-panel-tools button { display: grid; place-items: center; width: 28px; height: 28px; border-radius: 7px; color: #ab8f9f; }
+.agentic-app .av-trace-panel-tools button:hover { color: var(--av-rose-deep); background: #f7eaf1; }
+.agentic-app .av-trace-panel-body { flex: 1; min-height: 0; overflow: auto; padding: 12px 14px 34px; scrollbar-gutter: stable; }
+.agentic-app .av-trace-panel-turn { display: flex; flex-direction: column; }
+.agentic-app .av-trace-panel-turn .av-field { margin: 2px 0 6px; font-size: 10px; }
+.agentic-app .av-trace-panel-turn select { padding: 8px 9px; font-size: 10px; }
+.agentic-app .av-trace-follow { align-self: flex-start; margin: 0 0 12px; padding: 5px 9px; border: 1px solid #e8d5e1; border-radius: 20px; background: #fff; font-size: 9px; color: #a0647f; }
+.agentic-app .av-trace-follow:hover { background: #f9edf3; }
+.agentic-app .av-trace-panel-status { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 2px 0 12px; }
+.agentic-app .av-trace-chip { padding: 4px 8px; border-radius: 20px; background: #f3e6ee; color: #9a6382; font-size: 9px; line-height: 1.5; }
+.agentic-app .av-trace-chip.is-running, .agentic-app .av-trace-chip.is-backstage { background: #eff4ec; color: #64805f; }
+.agentic-app .av-trace-chip.is-failed { background: #f9e5ea; color: #a54f6b; }
+.agentic-app .av-trace-agent { padding: 4px 8px; border: 1px solid #eadde5; border-radius: 20px; background: #fff; color: #8d7082; font-size: 9px; line-height: 1.5; }
+.agentic-app .av-trace-panel-error { margin: 0 0 12px; color: #a4526f; font-size: 10px; line-height: 1.7; overflow-wrap: anywhere; }
+.agentic-app .av-trace-panel .av-call-attempt { margin: 12px 0 18px; }
+.agentic-app .av-trace-panel .av-call { padding: 11px; }
+.agentic-app .av-trace-panel .av-call-model { font-size: 10px; margin: 7px 0; }
+.agentic-app .av-trace-panel .av-usage { font-size: 10px; }
+.agentic-app .av-trace-panel .av-call-heading strong { font-size: 10px; }
+.agentic-app .av-trace-panel .av-call-heading > span { white-space: nowrap; }
+.agentic-app .av-call-io { margin-top: 10px; }
+.agentic-app .av-call-io-label { display: block; margin: 11px 0 5px; color: #98748a; font-size: 9px; letter-spacing: .6px; }
+.agentic-app .av-call pre.av-call-io-block { max-height: none; margin: 0; padding: 9px 10px; background: #f8f3f6; border-radius: 6px; color: #6d5965; font: 11px/1.7 ui-monospace, Consolas, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+@media (max-width: 1360px) { .agentic-app .av-trace-panel { flex-basis: 402px; width: 402px; } }
+@media (max-width: 1150px) { .agentic-app .av-trace-panel { flex-basis: 342px; width: 342px; } .agentic-app .av-trace-panel-head { min-height: 76px; padding: 13px 13px; } }
+@media (max-width: 900px) { .agentic-app .av-trace-panel { display: none; } }
+
+.agentic-app.av-admin-app { grid-template-columns: minmax(0, 1fr) auto; }
+.agentic-app .av-admin-toolbar, .agentic-app .av-admin-content { padding: 20px 30px; }
+.agentic-app .av-admin-toolbar .av-field { max-width: 600px; }
+.agentic-app .av-admin-content { overflow: auto; min-height: 0; }

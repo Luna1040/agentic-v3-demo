@@ -1,3 +1,4 @@
+import { createAdminApiClient } from '../web/admin/api';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createElement } from 'react';
@@ -5,8 +6,8 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import type { RuntimeAuditView } from '../shared/contracts';
 import { createApiClient } from '../web/api';
 import { MemoryDrawer } from '../web/MemoryDrawer';
-import { RuntimeAuditRecords } from '../web/RuntimeAudit';
-import { auditBatches, auditFieldChanges, auditFieldSource } from '../web/runtime-audit-model';
+import { RuntimeAuditRecords } from '../web/admin/RuntimeAudit';
+import { auditBatches, auditFieldChanges, auditFieldSource } from '../web/admin/runtime-audit-model';
 
 const at='2026-10-26T10:00:00Z';
 function fixture(): RuntimeAuditView {
@@ -70,7 +71,7 @@ test('field provenance follows the last actual field change, preserving earlier 
 
 test('audit endpoint reads are GET-only; recording is one explicit POST with host authorization preserved',async()=>{
   const requests:{url:string;method:string;body:unknown;authorization:string|null;signal:AbortSignal|null|undefined}[]=[];
-  const api=createApiClient({baseUrl:'https://example.test/api/',getHeaders:()=>({Authorization:'Bearer host-token'}),fetch:async(url,init)=>{
+  const api=createAdminApiClient({baseUrl:'https://example.test/api/',getHeaders:()=>({Authorization:'Bearer host-token'}),fetch:async(url,init)=>{
     requests.push({url:String(url),method:init?.method??'GET',body:init?.body?JSON.parse(String(init.body)):null,authorization:new Headers(init?.headers).get('authorization'),signal:init?.signal});
     return new Response(JSON.stringify(fixture()),{headers:{'Content-Type':'application/json'}});
   }});
@@ -88,11 +89,11 @@ test('audit endpoint reads are GET-only; recording is one explicit POST with hos
   assert.equal(requests[0].signal,abort.signal);
 });
 
-test('developer audit entry is gated and seven collected turns do not imply background success',()=>{
+test('consumer drawer excludes administration while admin audit retains collection status',()=>{
   const view=fixture();
   const props={world:{id:'w',title:'晚饭',revision:1,createdAt:at,events:[]},creating:false,busy:false,client:createApiClient(),onWorld:()=>{},onRefresh:async()=>{},onContinue:()=>{},onClose:()=>{}};
   assert.ok(!renderToStaticMarkup(createElement(MemoryDrawer,props)).includes('队列与入库'));
-  assert.ok(renderToStaticMarkup(createElement(MemoryDrawer,{...props,developerTools:true})).includes('队列与入库'));
+  assert.ok(!renderToStaticMarkup(createElement(MemoryDrawer,{...props,world:{...props.world,mainlinePlan:undefined}})).includes('队列与入库'));
   view.turns=[...view.turns,...[4,5,6,7].map(index=>({...view.turns[0],id:`turn-${index}`,seq:20+index}))];
   let html=renderToStaticMarkup(createElement(RuntimeAuditRecords,{view}));assert.ok(html.includes('7 轮已收齐，后台仍在处理'));
   view.backlog.pendingTurns=0;html=renderToStaticMarkup(createElement(RuntimeAuditRecords,{view}));assert.ok(html.includes('存在归档失败'));assert.ok(html.includes('仍有候选未应用'));

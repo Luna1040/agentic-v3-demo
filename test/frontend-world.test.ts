@@ -1,3 +1,5 @@
+import { worldRecordCounts, worldBackgroundStatus } from '../web/admin/world-model';
+import { createAdminApiClient } from '../web/admin/api';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createElement } from 'react';
@@ -5,14 +7,14 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import type { Character, Message, SessionDetail, TurnEvent, WorldEntity, WorldView } from '../shared/contracts';
 import { createApiClient } from '../web/api';
 import { applyTurnEvent, initialConversation, needsOpening, openingAttempt, recoverTurn } from '../web/conversation-state';
-import { messageCharacter, worldCharacters, worldRecordCounts, worldBackgroundStatus } from '../web/world-model';
+import { messageCharacter, worldCharacters } from '../web/world-model';
 import { SceneBuilder } from '../web/SceneBuilder';
 import { EntityCard, WorldArchive } from '../web/WorldArchive';
 import { MessageBubble } from '../web/ChatMessage';
 import { SceneEditor, SceneStrip } from '../web/ScenePanel';
 import { sceneDraft, sceneDraftReducer, scenePatch } from '../web/scene-state';
-import { agentLabels } from '../web/agent-labels';
-import { readPromptDrafts, writePromptDrafts } from '../web/prompt-drafts';
+import { agentLabels } from '../web/admin/agent-labels';
+import { readPromptDrafts, writePromptDrafts } from '../web/admin/prompt-drafts';
 
 const root: Character = { id: 'root', name: '根角色', subtitle: '根卡', description: '原始角色', initial: '根', color: 'sage', greeting: '旧欢迎', source: 'legacy', thumbnailUrl: '/root.png' };
 const entity = (id: string, name: string, kind: WorldEntity['kind'] = 'npc'): WorldEntity => ({ id, name, kind, description: '故事生成', state: { origin: '送信人来访', initial: name.slice(0, 1), color: 'blue' }, knownByCharacterIds: ['root'], sourceTurnId: 'turn1', createdAt: '2026-10-21T00:00:00Z', updatedAt: '2026-10-21T00:00:00Z' });
@@ -34,8 +36,7 @@ test('world entity cards render persisted state and resolve item, quest and NPC 
   const quest = render({ ...entity('quest1', '归还习题册', 'quest'), state: { status: 'active', ownerCharacterId: 'npc1', dueAt: '2026-10-22T06:00:00Z', result: '等待归还' } });
   assert.match(quest, /<dt>状态<\/dt><dd>进行中<\/dd>/);
   assert.match(quest, /<dt>负责人<\/dt><dd>送信人<\/dd>/);
-  assert.match(quest, /<dt>约定时间<\/dt><dd>2026\/10\/22/);
-  assert.match(quest, /<dt>结果<\/dt><dd>等待归还<\/dd>/);
+  assert.doesNotMatch(quest, /约定时间|等待归还/);
   const npc = render({ ...entity('npc1', '送信人'), state: { locationId: 'place1' } });
   assert.match(npc, /<dt>最近确认地点<\/dt><dd>旧书店<\/dd>/);
   const departing = render({ ...entity('npc1', '送信人'), state: { locationId: null } });
@@ -50,13 +51,12 @@ test('entity cards omit missing, invalid and wrong-kind state references instead
   assert.doesNotMatch(quest, /av-entity-details|约定时间|负责人|尚未记录状态|av-entity-arc|not-a-date|place1/);
 });
 
-test('NPC summaries display viewpoint and source attribution without certifying player motives', () => {
+test('consumer NPC cards omit internal character summaries and provenance', () => {
   const render = (state: Record<string, unknown>) => renderToStaticMarkup(createElement(EntityCard, { entity: { ...entity('npc1', '送信人'), state }, entities: world.entities!, templates: [root], busy: false, onScene: () => {} }));
   const legacy = render({ arc: '她觉得玩家很紧张。' });
-  assert.match(legacy, /角色视角摘要/); assert.match(legacy, /旧摘要 · 来源未核验/);
+  assert.doesNotMatch(legacy, /角色视角摘要|她觉得玩家很紧张|旧摘要/);
   const sourced = render({ arc: '她猜测玩家在偷懒。', arcProvenance: { kind: 'character_view', status: 'source_verified', turnId: 'turn1', source: 'actor', characterId: 'npc1', quote: '她说：“你是不是在偷懒？”' } });
-  assert.match(sourced, /可能包含主观判断/); assert.match(sourced, /查看本次摘要的来源片段/);
-  assert.match(sourced, /来源可追溯，不代表整段摘要已经核实/);
+  assert.doesNotMatch(sourced, /她猜测玩家在偷懒|你是不是在偷懒|arcProvenance|source_verified/);
 });
 
 test('world cast is derived from persisted NPC entities, never the unrelated seed catalog', () => {
@@ -141,7 +141,7 @@ test('operation messages are hidden and a newly streamed NPC never borrows the r
 
 test('new world endpoints preserve namespace, revision and opening identity without synthetic user text', async () => {
   const calls: { url: string; init?: RequestInit }[] = [];
-  const client = createApiClient({ baseUrl: '/feature/api', fetch: async (url, init) => { calls.push({ url: String(url), init }); return String(url).endsWith('/opening') ? new Response('event: cancelled\ndata: {"type":"cancelled","turnId":"t","code":"CANCELLED","message":"停止"}\n\n', { headers: { 'content-type': 'text/event-stream' } }) : Response.json({}); } });
+  const client = createAdminApiClient({ baseUrl: '/feature/api', fetch: async (url, init) => { calls.push({ url: String(url), init }); return String(url).endsWith('/opening') ? new Response('event: cancelled\ndata: {"type":"cancelled","turnId":"t","code":"CANCELLED","message":"停止"}\n\n', { headers: { 'content-type': 'text/event-stream' } }) : Response.json({}); } });
   await client.world('world/one');
   await client.updateClock('world/one', { expectedRevision: 7, mode: 'quiet', rate: 3 });
   await client.createSession({ characterId: 'root', dynamicOpening: true, scene: world.scene });
@@ -182,9 +182,8 @@ test('saved interactions are counted independently of selected player memories a
   const event = { id: 'event1', kind: 'fact' as const, text: '玩家原话', visibility: 'private' as const, characterId: 'root', sourceTurnId: 'turn1', createdAt: '', status: 'active' as const, evidence: { source: 'user' as const, turnId: 'turn1' } };
   const episode = { turnId: 'turn1', sessionId: 'session', kind: 'chat' as const, occurredAt: '', scene: world.scene!, participantIds: ['root'], userText: '消息', replies: [] };
   assert.deepEqual(worldRecordCounts({ ...world, events: [], episodes: [episode, { ...episode, turnId: 'opening', kind: 'opening' }] }), { quotations: 0, interactions: 2 });
-  const html = renderToStaticMarkup(createElement(WorldArchive, { world: { ...world, episodes: [episode, { ...episode, turnId: 'opening', kind: 'opening' }, { ...episode, kind: 'pulse' }] }, templates: [root], client: createApiClient(), busy: false, onBack: () => {}, onScene: () => {}, onSession: () => {}, onUpdated: async () => {} }));
-  assert.match(html, /2 段已提交互动/);
-  assert.doesNotMatch(html, /3 段已提交互动/);
+  const html = renderToStaticMarkup(createElement(WorldArchive, { world: { ...world, episodes: [episode, { ...episode, turnId: 'opening', kind: 'opening' }, { ...episode, kind: 'pulse' }] }, templates: [root], client: createApiClient(), busy: false, onBack: () => {}, onScene: () => {}, onUpdated: async () => {} }));
+  assert.doesNotMatch(html, /段已提交互动|完整互动|世界动态/);
   assert.deepEqual(worldRecordCounts({ ...world, events: [event, { ...event, id: 'inactive', status: 'retracted' }, { ...event, id: 'old', status: 'unverified' }, { ...event, id: 'unsupported', evidence: null }], episodes: [episode, episode, { ...episode, kind: 'pulse' }] }), { quotations: 1, interactions: 1 });
 });
 
