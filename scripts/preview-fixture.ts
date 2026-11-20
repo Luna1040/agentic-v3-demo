@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
-import { ServiceError, type PromptSet, type StoryRuntime } from '../server/runtime.ts';
+import { ServiceError, type ActorInput, type PromptSet, type StoryRuntime } from '../server/runtime.ts';
 import type { StoryStore } from '../server/store.ts';
 import type { AgentCallRecord, AgentKey, Character, Message, PlayerProfile, PromptVersion, SceneState, Session, TurnStatus, TurnView, WorldView } from '../shared/contracts.ts';
 
@@ -153,8 +153,8 @@ export function createPreviewFixture() {
   const currentPrompts = () => Object.fromEntries([...prompts].map(([key, versions]) => [key, versions.at(-1)!.content])) as PromptSet;
   const buildRuntime = (overrides?: PromptSet): StoryRuntime => {
     const effective = () => overrides ?? currentPrompts();
-    const reply = (packet: Input) => `【本地演示 · 无模型调用】${packet.character.name}轻轻点头：“${packet.operation === 'opening' ? '故事从这里开始，我们慢慢聊。' : '我听到了：' + packet.userText.slice(0, 100)}”\n\n这是用于检查聊天、流式显示与管理端隔离的固定回复。页面修改仅保存在本次进程内。`;
-    const run: NonNullable<StoryRuntime['runTurn']> = async (packet, options) => {
+    const reply = (packet: ActorInput) => `【本地演示 · 无模型调用】${packet.character.name}轻轻点头：“${packet.operation === 'opening' ? '故事从这里开始，我们慢慢聊。' : '我听到了：' + packet.userText.slice(0, 100)}”\n\n这是用于检查聊天、流式显示与管理端隔离的固定回复。页面修改仅保存在本次进程内。`;
+    const run = (async (packet, options) => {
       options.signal.throwIfAborted();
       const call: AgentCallRecord = { id: randomUUID(), parentId: null, attemptId: options.attemptId, agent: 'actor', status: 'running', model: 'preview-template-no-model', startedAt: now(), input: { preview: true, systemPrompt: effective().actor, character: packet.character, userText: packet.userText } };
       await options.onCall?.(call);
@@ -162,7 +162,7 @@ export function createPreviewFixture() {
       for (let index = 0; index < content.length; index += 10) { await delay(25, undefined, { signal: options.signal }); options.onTextDelta(content.slice(index, index + 10)); }
       await options.onCall?.({ ...call, status: 'completed', completedAt: now(), output: { preview: true, text: content } });
       return { text: content, changes: [], usage: {}, scene: packet.scene };
-    };
+    }) satisfies NonNullable<StoryRuntime['runTurn']>;
     return { prompts: effective(), metadata: { preview: true, storage: 'in-memory', provider: 'deterministic-template', modelCalls: 0 },
       status: { provider: 'demo', model: 'preview-template-no-model', harness: { loaded: false, version: 'not-loaded-local-preview' }, offlineSimulation: false, modelRouter: 'fixture' },
       actor: async (packet, options) => { options.signal.throwIfAborted(); const content = reply(packet); options.onTextDelta(content); return { text: content }; },
