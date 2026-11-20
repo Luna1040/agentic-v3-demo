@@ -8,6 +8,7 @@
   },
   "scripts": {
     "dev": "tsx server/index.ts",
+    "preview:local": "tsx scripts/preview-local.ts",
     "start": "tsx server/index.ts --production",
     "build": "vite build && node scripts/check-consumer-build.mjs",
     "check": "tsc --noEmit",
