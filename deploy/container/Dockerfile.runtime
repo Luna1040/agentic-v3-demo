@@ -1,0 +1,30 @@
+ARG NODE_IMAGE=node:22-bookworm-slim
+FROM ${NODE_IMAGE}
+ARG APP_COMMIT
+ARG HARNESS_COMMIT
+LABEL org.opencontainers.image.revision=$APP_COMMIT \
+      agentic.harness.commit=$HARNESS_COMMIT
+WORKDIR /build
+COPY app-source.tar harness-source.tar source-archives.sha256 provenance.json build-runtime.mjs ./
+RUN sha256sum -c source-archives.sha256 \
+ && mkdir /app /runtime \
+ && tar -xf app-source.tar -C /app \
+ && tar -xf harness-source.tar -C /runtime
+WORKDIR /runtime
+RUN npm ci --ignore-scripts --no-audit --no-fund \
+ && node node_modules/typescript/bin/tsc -p apps/agentic-v3/tsconfig.json --noEmitOnError
+WORKDIR /app
+RUN npm ci --no-audit --no-fund \
+ && node /build/build-runtime.mjs \
+ && npm run check \
+ && npm run build \
+ && npm run build:admin \
+ && node --import tsx --test test/auth-entry.test.ts test/consumer-boundary.test.ts test/consumer-privacy.test.ts test/frontend.test.ts \
+ && node --test /runtime/dist/test/agentic-v3-visible-text.test.js /runtime/dist/test/agentic-v3-dialogue-tool.test.js /runtime/dist/test/agentic-v3-scene-rewrite.test.js /runtime/dist/test/agentic-v3-old-agent-team.test.js /runtime/dist/test/agentic-v3-runtime.test.js
+ENV NODE_ENV=production \
+    HARNESS_ROOT=/runtime \
+    HARNESS_MODULE_PATH=/runtime/dist/apps/agentic-v3/index.js \
+    OLD_AGENT_TEAM=false \
+    LOCAL_DEMO_ONLY=false
+USER node
+CMD ["node", "--import", "tsx", "server/index.ts", "--production"]
